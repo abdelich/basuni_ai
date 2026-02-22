@@ -14,7 +14,12 @@ from src.core.agent import Agent
 from src.core.agent_ctx import AgentContext
 from src.core.db import get_db
 from src.core.models import ElderCase
-from src.core.discord_guild import get_guild_channels_json, get_guild_roles_and_members_json
+from src.core.discord_guild import (
+    get_guild_channels_json,
+    get_guild_roles_and_members_json,
+    get_author_roles_block_async,
+    get_law_block_async,
+)
 from src.core.conversation_memory import save_message, load_recent_messages
 from src.roles.base import RoleBot, RoleDeps
 from src.roles.elder.tools import make_elder_tools
@@ -34,11 +39,24 @@ def _has_pmj_role(message: Message, pmj_role_id: int | None) -> bool:
     return any(r.id == pmj_role_id for r in member.roles)
 
 
+def _detect_case_type(content: str) -> str:
+    """По тексту обращения определяем тип дела: референдум или апелляция по процедуре."""
+    text = (content or "").lower()
+    ref_markers = (
+        "референдум", "референдума", "референдуму", "проведени", "провести референдум",
+        "прошу рассмотреть возможность проведения референдума", "запрос на референдум",
+    )
+    if any(m in text for m in ref_markers):
+        return "referendum_request"
+    return "appeal_procedure"
+
+
 async def _create_elder_case(guild_id: int, author_id: int, channel_id: int, thread_id: int | None, content: str) -> int:
+    case_type = _detect_case_type(content)
     async with get_db() as session:
         case = ElderCase(
             guild_id=guild_id,
-            case_type="appeal_procedure",
+            case_type=case_type,
             status="open",
             author_id=author_id,
             channel_id=channel_id,
@@ -141,23 +159,49 @@ class ElderBot(RoleBot):
             return
 
         history = await load_recent_messages(self.role_key, guild.id, channel_id, thread_id, limit=20)
+        author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "") or "Гражданин"
+        # Роли обратившегося: передаём member из сообщения, чтобы данные были точными (не зависят от fetch_member/Intent)
+        author_block, author_role_names = await get_author_roles_block_async(
+            self, guild.id, message.author.id, author_name, member=getattr(message.author, "roles", None) and message.author or None
+        )
+        # Закон в контексте при каждом сообщении — агент действует в рамках конституции
+        law_block = await get_law_block_async(
+            self, guild.id, max_chars=10000,
+            reference_category_name=getattr(self.config, "reference_category_name", None) or "право",
+        )
         channels_json = get_guild_channels_json(self, guild.id)
         roles_json = get_guild_roles_and_members_json(self, guild.id)
-        author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "") or "Гражданин"
-
+        ch_decisions = self.config.channel_for_role(self.role_key, "decisions")
+        ch_court = self.config.channel_for_role(self.role_key, "notify_court")
+        ch_council = self.config.channel_for_role(self.role_key, "notify_council")
+        elder_channels_line = (
+            f"Каналы старейшин (используй для публикации решений и уведомлений): "
+            f"decisions={ch_decisions or '—'}, notify_court={ch_court or '—'}, notify_council={ch_council or '—'}. "
+            f"Для отправки в суд/совет вызывай send_message_to_channel(channel_id, текст).\n"
+        )
         context_block = (
-            "Данные сервера: каналы (id, name, category_name, topic) и роли с участниками (id, name, members). "
-            "Используй для выбора канала и понимания, кто в какой роли.\n"
+            elder_channels_line
+            + "Данные сервера: каналы (id, name, category_name, topic, viewable_by_roles, denied_for_roles) и роли с участниками. "
+            "Перед рекомендацией канала проверь доступ обратившегося (его роли — см. блок «КОМУ ТЫ ОТВЕЧАЕШЬ»).\n"
             "Каналы:\n" + channels_json + "\n\nРоли и участники:\n" + roles_json + "\n\n---\n"
         )
-        current_user_content = f"Обращение №{case_id}. Гражданин **{author_name}** пишет: {content}"
+        current_user_content = (
+            author_block
+            + f"Обращение №{case_id}. Сообщение: {content}"
+        )
+        # В начало контекста — закон, чтобы агент всегда опирался на него
+        law_prefix = law_block + "\n\n---\n"
 
         messages_for_llm: list[dict[str, Any]] = []
         if history:
             messages_for_llm.extend(history)
-        messages_for_llm.append({"role": "user", "content": context_block + current_user_content})
+        full_user_content = law_prefix + context_block + current_user_content
+        messages_for_llm.append({"role": "user", "content": full_user_content})
 
-        agent_ctx = self._agent_context(guild.id, extra={"current_case_id": case_id})
+        agent_ctx = self._agent_context(
+            guild.id,
+            extra={"current_case_id": case_id, "author_id": message.author.id, "author_display_name": author_name},
+        )
         agent = self._build_agent(agent_ctx)
 
         try:
