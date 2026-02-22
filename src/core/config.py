@@ -99,6 +99,11 @@ class Config:
         return channels.get(channel_key) if isinstance(channel_key, str) else None
 
     @property
+    def reference_category_name(self) -> str:
+        """Название категории Discord, в которой лежат прецеденты и закон (подканалы). Все агенты читают её и ссылаются на закон при необходимости."""
+        return self._raw.get("reference_category_name") or "право"
+
+    @property
     def enabled_roles(self) -> list[str]:
         """Список ролей, которые оркестратор должен запустить."""
         return self._raw.get("enabled_roles", ["elder"])
