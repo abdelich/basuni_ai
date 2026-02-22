@@ -1,0 +1,46 @@
+# BasuniAI — конфигурация по умолчанию
+# Секреты (токены, API-ключи) — в .env
+
+# ID гильдии Discord
+guild_id: 499894818642591744
+
+# Каналы: ключ -> ID канала (подставьте свои ID)
+# Боты привязаны к каналам через roles.<role>.xxx_channel_key
+channels:
+  # Старейшины: приём заявок, публикация решений, уведомления
+  elder_inbox: 1475109427425050694
+  elder_decisions: 1474353883018170509
+  # Остальные инстанции
+  court_inbox: 0
+  council_inbox: 0
+  prosecutor_inbox: 0
+  kpp_inbox: 0
+  referrals: 0
+
+# ID ролей Discord (для проверки полномочий).
+# pmj — роль ПМЖ: только пользователи с этой ролью могут обращаться к старейшинам. Если 0 — проверка отключена.
+role_ids:
+  pmj: 1474389076051361874
+  vnj: 1474388540786737367
+  temporary: 1474386228475461643
+  elder: 1474908542237544502
+  council: 1474393655853715550
+  prosecutor: 1474391909249318994
+  kpp: 1474390784621940952
+  judge: 1474393550866350151
+
+# Какие боты запускать (ключи: elder, council, prosecutor, kpp, judge)
+enabled_roles:
+  - elder
+
+# Привязка каналов и опции по ролям
+# xxx_channel_key — ключ из блока channels выше
+roles:
+  elder:
+    inbox_channel_key: elder_inbox      # куда граждане пишут заявки
+    decisions_channel_key: elder_decisions  # куда бот публикует решения
+    outbox_channel_key: elder_inbox     # куда отвечать по умолчанию (можно тред)
+    notify_court_channel_key: court_inbox
+    notify_council_channel_key: council_inbox
+    referrals_channel_key: referrals
+    may_notify_channel_keys: [court_inbox, council_inbox]

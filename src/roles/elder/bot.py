@@ -1,6 +1,6 @@
 """
-Бот «Старейшина»: агент с памятью переписок, отвечает только когда к нему обращаются.
-Ответ приходит как reply на сообщение пользователя. Характер — мудрец, с никами и шутками.
+Бот «Старейшина»: агент с памятью переписок. Читает все сообщения в канале и сам решает, кому и когда отвечать.
+Ответ приходит как reply на сообщение пользователя. Характер — мудрый старейшина.
 """
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from src.roles.elder.tools import make_elder_tools
 
 logger = logging.getLogger("basuni.elder.bot")
 
-# Фразы, с которых считается обращение к старейшине (если сообщение не reply и не mention)
-DEFAULT_TRIGGER_PHRASES = ("старейшина", "старейшины", "старейшине", "старейшину")
+# Если агент вернёт ровно это — ответ в Discord не отправляем (старейшина решил не отвечать)
+SKIP_REPLY_MARKER = "НЕТ"
 
 
 def _has_pmj_role(message: Message, pmj_role_id: int | None) -> bool:
@@ -32,28 +32,6 @@ def _has_pmj_role(message: Message, pmj_role_id: int | None) -> bool:
     if not member:
         return False
     return any(r.id == pmj_role_id for r in member.roles)
-
-
-async def _is_addressed_to_elder(message: Message, bot_user_id: int, trigger_phrases: list[str]) -> bool:
-    """Сообщение к старейшине: упоминание бота, ответ на бота или начало с триггер-фразы."""
-    content = (message.content or "").strip().lower()
-    if message.mentions and any(m.id == bot_user_id for m in message.mentions):
-        return True
-    if message.reference:
-        ref = message.reference.resolved
-        if ref is None and message.reference.message_id:
-            try:
-                ref = await message.channel.fetch_message(message.reference.message_id)
-            except Exception:
-                ref = None
-        if ref and getattr(ref, "author", None) and getattr(ref.author, "id", None) == bot_user_id:
-            return True
-    if not content:
-        return False
-    for phrase in trigger_phrases:
-        if content.startswith(phrase.lower()):
-            return True
-    return False
 
 
 async def _create_elder_case(guild_id: int, author_id: int, channel_id: int, thread_id: int | None, content: str) -> int:
@@ -76,7 +54,6 @@ class ElderBot(RoleBot):
     def __init__(self, deps: RoleDeps, **kwargs: object) -> None:
         super().__init__(role_key="elder", deps=deps, command_prefix="!", **kwargs)
         self._inbox_channel_id: int | None = None
-        self._trigger_phrases: list[str] = []
 
     def _agent_context(self, guild_id: int, extra: dict[str, Any] | None = None) -> AgentContext:
         cfg = self.config
@@ -107,9 +84,8 @@ class ElderBot(RoleBot):
     async def setup_hook(self) -> None:
         await super().setup_hook()
         self._inbox_channel_id = self.config.channel_for_role(self.role_key, "inbox")
-        self._trigger_phrases = self.config.role_config(self.role_key).get("reply_trigger_phrases") or list(DEFAULT_TRIGGER_PHRASES)
         if self._inbox_channel_id:
-            logger.info("Старейшина: inbox канал %s, триггеры: %s", self._inbox_channel_id, self._trigger_phrases[:3])
+            logger.info("Старейшина: inbox канал %s (читает все сообщения, сам решает кому отвечать)", self._inbox_channel_id)
 
     async def on_message(self, message: Message) -> None:
         if message.author.bot:
@@ -118,10 +94,6 @@ class ElderBot(RoleBot):
 
         inbox_id = self._inbox_channel_id or self.config.channel_for_role(self.role_key, "inbox")
         if not inbox_id or message.channel.id != inbox_id:
-            await self.process_commands(message)
-            return
-
-        if not await _is_addressed_to_elder(message, self.user.id, self._trigger_phrases):
             await self.process_commands(message)
             return
 
@@ -194,7 +166,8 @@ class ElderBot(RoleBot):
             logger.exception("Ошибка агента старейшины")
             reply = f"Произошла ошибка при обработке обращения: {e!r}"
 
-        if reply:
+        reply_clean = (reply or "").strip()
+        if reply_clean and reply_clean.upper() != SKIP_REPLY_MARKER:
             try:
                 await message.reply(reply[:2000])
             except Exception as e:
@@ -203,18 +176,19 @@ class ElderBot(RoleBot):
                     await message.channel.send(reply[:2000])
                 except Exception:
                     pass
-            await save_message(
-                role_key=self.role_key,
-                guild_id=guild.id,
-                channel_id=channel_id,
-                thread_id=thread_id,
-                case_id=case_id,
-                discord_message_id=message.id,
-                author_id=message.author.id,
-                author_display_name=author_name,
-                role="user",
-                content=current_user_content,
-            )
+        await save_message(
+            role_key=self.role_key,
+            guild_id=guild.id,
+            channel_id=channel_id,
+            thread_id=thread_id,
+            case_id=case_id,
+            discord_message_id=message.id,
+            author_id=message.author.id,
+            author_display_name=author_name,
+            role="user",
+            content=current_user_content,
+        )
+        if reply_clean:
             await save_message(
                 role_key=self.role_key,
                 guild_id=guild.id,
