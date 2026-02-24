@@ -179,10 +179,11 @@ class ElderBot(RoleBot):
         author_block, author_role_names = await get_author_roles_block_async(
             self, guild.id, message.author.id, author_name, member=getattr(message.author, "roles", None) and message.author or None
         )
-        # Закон в контексте при каждом сообщении — агент действует в рамках конституции
+        # Закон в контексте при каждом сообщении — агент действует только по закону (каналы из конфига: база, судебные прецеденты)
         law_block = await get_law_block_async(
-            self, guild.id, max_chars=10000,
+            self, guild.id, max_chars=12000,
             reference_category_name=getattr(self.config, "reference_category_name", None) or "право",
+            config=self.config,
         )
         channels_json = get_guild_channels_json(self, guild.id)
         roles_json = get_guild_roles_and_members_json(self, guild.id)
@@ -278,19 +279,24 @@ class ElderBot(RoleBot):
             member=getattr(message.author, "roles", None) and message.author or None,
         )
         law_block = await get_law_block_async(
-            self, guild.id, max_chars=8000,
+            self, guild.id, max_chars=10000,
             reference_category_name=getattr(self.config, "reference_category_name", None) or "право",
+            config=self.config,
         )
+        author_id = message.author.id
         oversight_user = (
             law_block + "\n\n---\n\n"
             + "[ РЕЖИМ НАДЗОРА ]\n"
-            + f"Канал: {channel_name} (id={message.channel.id}).\n"
+            + f"Канал: {channel_name} (id={message.channel.id}). author_id для упоминания: {author_id} (в ответе пиши <@{author_id}> чтобы упомянуть автора).\n"
             + author_block
             + f"\nСообщение участника: {content[:1500]}\n\n"
-            "Проверь: 1) соответствие закону 2) есть ли у автора право на это действие (роли) 3) легитимность процедуры. "
-            "Если легитимно — ответь ровно: ЛЕГИТИМНО. Если нелегитимно — ответь одним сообщением для постинга в канал: прерывание процедуры, указание нарушения, ссылка на закон."
+            "1) Проверь по закону: соответствие закону, право автора на действие (роли), легитимность процедуры. "
+            "2) Если это обращение к старейшине (суд вернул дело, задал вопрос, просит разъяснение и т.д.) — ты можешь ответить по делу. Тогда ответь ровно: ОТВЕТ: и далее твой текст; в тексте упомяни автора: <@"
+            + str(author_id) + ">. "
+            "3) Если только проверка и отвечать не нужно — ответь ровно: ЛЕГИТИМНО. "
+            "4) Если нелегитимно — ответь одним сообщением для постинга (без ОТВЕТ:): прерывание, нарушение, ссылка на закон."
         )
-        agent_ctx = self._agent_context(guild.id, extra={"author_id": message.author.id})
+        agent_ctx = self._agent_context(guild.id, extra={"author_id": author_id})
         agent = self._build_agent(agent_ctx)
         try:
             reply = await agent.run([{"role": "user", "content": oversight_user}])
@@ -302,6 +308,21 @@ class ElderBot(RoleBot):
             return
         if not reply_clean:
             return
+        # Ответ старейшины по существу (суд вернул дело, вопрос и т.д.) — постим с упоминанием
+        if reply_clean.upper().startswith("ОТВЕТ:"):
+            to_send = reply_clean[6:].strip()[:2000]
+            if not to_send:
+                return
+            try:
+                await message.reply(to_send)
+            except Exception as e:
+                logger.exception("Не удалось отправить ответ старейшины в канал надзора")
+                try:
+                    await message.channel.send(to_send)
+                except Exception:
+                    pass
+            return
+        # Прерывание нелегитимного
         try:
             await message.reply(reply_clean[:2000])
         except Exception as e:

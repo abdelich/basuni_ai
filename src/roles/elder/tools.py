@@ -26,6 +26,23 @@ from src.core.discord_guild import (
 logger = logging.getLogger("basuni.elder.tools")
 
 
+def _mentions_for_role(bot: Any, guild_id: int, role_config_key: str) -> str:
+    """Строка упоминаний всех участников с данной ролью: <@id1> <@id2> ..."""
+    guild = bot.get_guild(guild_id) if hasattr(bot, "get_guild") else None
+    if not guild or not hasattr(bot, "config") or not bot.config:
+        return ""
+    role_ids = getattr(bot.config, "role_ids", None)
+    if not callable(role_ids):
+        return ""
+    rid = role_ids().get(role_config_key)
+    if not rid:
+        return ""
+    role = guild.get_role(int(rid))
+    if not role or not getattr(role, "members", None):
+        return ""
+    return " ".join(f"<@{m.id}>" for m in role.members if not getattr(m, "bot", False))
+
+
 def make_elder_tools(ctx: AgentContext) -> list[Tool]:
     """Создаёт список инструментов старейшины с привязкой к контексту (бот, гильдия, БД)."""
 
@@ -91,31 +108,35 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             return f"Ошибка отправки: {e!r}"
 
     async def notify_court(content: str) -> str:
-        """Уведомить суд: отправить сообщение в канал суда (court_inbox). Используй после принятия обращения по делу о референдуме или апелляции — суд должен знать о деле."""
+        """Уведомить суд: отправить сообщение в канал суда (court_inbox), с упоминанием всех судей (@). Используй после принятия обращения по делу о референдуме или апелляции."""
         ch_id = ctx.get_channel_id("notify_court")
         if not ch_id:
             return "В конфиге не задан канал суда (notify_court). Используй send_message_to_channel с ID из контекста."
         channel = ctx.bot.get_channel(ch_id)
         if not channel:
             return f"Канал суда {ch_id} не найден."
+        mentions = _mentions_for_role(ctx.bot, ctx.guild_id, "judge")
+        full = (f"{mentions}\n\n{content}" if mentions else content).strip()[:2000]
         try:
-            await channel.send(content[:2000])
-            return "Уведомление в суд отправлено."
+            await channel.send(full)
+            return "Уведомление в суд отправлено (судьи упомянуты)."
         except Exception as e:
             logger.exception("notify_court")
             return f"Ошибка отправки в суд: {e!r}"
 
     async def notify_council(content: str) -> str:
-        """Уведомить совет: отправить сообщение в канал совета (council_inbox). Используй когда решение старейшин передаётся на исполнение в совет."""
+        """Уведомить совет: отправить сообщение в канал совета (council_inbox), с упоминанием всех членов совета (@). Используй когда решение старейшин передаётся на исполнение в совет."""
         ch_id = ctx.get_channel_id("notify_council")
         if not ch_id:
             return "В конфиге не задан канал совета (notify_council). Используй send_message_to_channel с ID из контекста."
         channel = ctx.bot.get_channel(ch_id)
         if not channel:
             return f"Канал совета {ch_id} не найден."
+        mentions = _mentions_for_role(ctx.bot, ctx.guild_id, "council")
+        full = (f"{mentions}\n\n{content}" if mentions else content).strip()[:2000]
         try:
-            await channel.send(content[:2000])
-            return "Уведомление в совет отправлено."
+            await channel.send(full)
+            return "Уведомление в совет отправлено (члены совета упомянуты)."
         except Exception as e:
             logger.exception("notify_council")
             return f"Ошибка отправки в совет: {e!r}"
@@ -363,13 +384,13 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
         ),
         Tool(
             name="notify_court",
-            description="Уведомить суд: отправить сообщение в канал суда. Вызывай после принятия обращения (референдум, апелляция), чтобы суд знал о деле — перед ответом гражданину.",
+            description="Уведомить суд: отправить сообщение в канал суда. В сообщение автоматически добавляются упоминания (@) всех судей. Вызывай после принятия обращения (референдум, апелляция).",
             parameters=build_parameters({"content": ("string", "Текст уведомления для суда (суть дела, номер обращения)")}, required=["content"]),
             execute=notify_court,
         ),
         Tool(
             name="notify_council",
-            description="Уведомить совет: отправить сообщение в канал совета. Вызывай когда решение старейшин передаётся на исполнение в совет (send_to_council).",
+            description="Уведомить совет: отправить сообщение в канал совета. В сообщение автоматически добавляются упоминания (@) всех членов совета. Вызывай когда решение старейшин передаётся на исполнение в совет (send_to_council).",
             parameters=build_parameters({"content": ("string", "Текст уведомления для совета")}, required=["content"]),
             execute=notify_council,
         ),

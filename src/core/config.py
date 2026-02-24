@@ -107,8 +107,25 @@ class Config:
 
     @property
     def reference_category_name(self) -> str:
-        """Название категории Discord, в которой лежат прецеденты и закон (подканалы). Все агенты читают её и ссылаются на закон при необходимости."""
+        """Название категории Discord, в которой лежат прецеденты и закон (подканалы). Все агенты читают её и действуют только по закону."""
         return self._raw.get("reference_category_name") or "право"
+
+    def law_channel_ids(self) -> list[int]:
+        """
+        ID каналов закона в порядке приоритета: [база (гос-образующие прецеденты), судебные прецеденты].
+        Ключи задаются в law_channels.base_precedents_key и law_channels.judicial_precedents_key;
+        значения — ключи из channels. Если ID = 0, канал пропускается. Все агенты должны опираться на эти каналы.
+        """
+        law = self._raw.get("law_channels") or {}
+        ch = self.channels()
+        out: list[int] = []
+        for key in ("base_precedents_key", "judicial_precedents_key"):
+            k = law.get(key)
+            if k and ch.get(k):
+                cid = ch[k]
+                if cid and int(cid) != 0:
+                    out.append(int(cid))
+        return out
 
     @property
     def enabled_roles(self) -> list[str]:

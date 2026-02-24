@@ -316,18 +316,64 @@ async def get_author_roles_block_async(
     return _member_roles_to_block(author_id, author_display_name or str(author_id), role_names, raw_json)
 
 
+# Подписи для приоритетных каналов закона (база и судебные прецеденты) — в конфиге задаются ID
+_LAW_PRIORITY_LABELS = ("База (гос-образующие прецеденты)", "Судебные прецеденты")
+
+
 async def get_law_block_async(
     bot: Any,
     guild_id: int,
     max_chars: int = 10000,
     reference_category_name: str = "право",
+    config: Any = None,
 ) -> str:
     """
-    Текст закона/прецедентов из категории «право» для контекста агента. Вызывай при каждом сообщении, чтобы агент всегда знал конституцию и действовал в её рамках.
+    Текст закона/прецедентов для контекста агента. Все агенты должны всегда смотреть на закон и действовать только по нему.
+    Если передан config с law_channel_ids() — сначала загружаются эти каналы (база, судебные прецеденты), затем остальные из категории «право».
     """
-    content = await get_all_reference_channel_contents_async(bot, guild_id, reference_category_name, limit_per_channel=50)
-    if content.startswith("{") and "error" in content:
-        return f"Закон и прецеденты (категория «{reference_category_name}»): [не удалось загрузить: {content}]"
+    parts: list[str] = []
+    priority_ids: list[int] = []
+    if config is not None and hasattr(config, "law_channel_ids") and callable(getattr(config, "law_channel_ids")):
+        priority_ids = list(config.law_channel_ids())
+    for i, ch_id in enumerate(priority_ids):
+        label = _LAW_PRIORITY_LABELS[i] if i < len(_LAW_PRIORITY_LABELS) else f"Канал {ch_id}"
+        ch_content = await get_channel_content_async(bot, ch_id, limit=50)
+        if ch_content.startswith("{") and "error" in ch_content:
+            parts.append(f"=== {label} (id: {ch_id}) ===\n[не удалось прочитать]")
+        else:
+            ch_name = ""
+            ch = bot.get_channel(ch_id) if hasattr(bot, "get_channel") else None
+            if ch and getattr(ch, "name", None):
+                ch_name = getattr(ch, "name", "")
+            parts.append(f"=== {label}" + (f" — {ch_name}" if ch_name else "") + f" (id: {ch_id}) ===\n{ch_content}")
+    rest = await get_all_reference_channel_contents_async(
+        bot, guild_id, reference_category_name, limit_per_channel=50
+    )
+    if rest.startswith("{") and "error" in rest:
+        if not parts:
+            return f"Закон и прецеденты: [не удалось загрузить: {rest}]"
+    else:
+        if priority_ids:
+            rest_ids = set(priority_ids)
+            guild = bot.get_guild(guild_id) if hasattr(bot, "get_guild") else None
+            if guild:
+                sub = (reference_category_name or "право").strip().lower()
+                other_parts = []
+                for ch in guild.text_channels:
+                    if not ch.category or sub not in (ch.category.name or "").lower():
+                        continue
+                    if ch.id in rest_ids:
+                        continue
+                    cnt = await get_channel_content_async(bot, ch.id, limit=50)
+                    if cnt.startswith("{") and "error" in cnt:
+                        other_parts.append(f"=== {ch.name} (id: {ch.id}) ===\n[не удалось прочитать]")
+                    else:
+                        other_parts.append(f"=== {ch.name} (id: {ch.id}) ===\n{cnt}")
+                if other_parts:
+                    parts.append("=== Остальные каналы категории «право» ===\n" + "\n\n".join(other_parts))
+        else:
+            parts.append(rest)
+    content = "\n\n".join(parts)
     if len(content) > max_chars:
         content = content[:max_chars] + "\n[... обрезано ...]"
-    return f"Закон и прецеденты (категория «{reference_category_name}»):\n{content}"
+    return f"Закон и прецеденты (все агенты действуют только по закону):\n{content}"
