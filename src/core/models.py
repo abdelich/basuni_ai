@@ -36,6 +36,7 @@ class ElderCase(Base):
     # Отсчёт срока для суда: когда дело передано в суд и до когда суд должен принять решение (по закону)
     sent_to_court_at = Column(DateTime, nullable=True)  # когда старейшина уведомил суд (начало отсчёта)
     court_deadline_hours = Column(Integer, nullable=True)  # срок по закону (часов) на решение суда
+    deadline_escalation_at = Column(DateTime, nullable=True)  # когда старейшина отреагировал на истечение срока (наблюдение)
 
 
 # --- Память переписок агентов (общая для всех ролей по role_key) ---

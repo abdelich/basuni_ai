@@ -1,14 +1,17 @@
 """
 Бот «Старейшина»: агент с памятью переписок. Читает все сообщения в канале и сам решает, кому и когда отвечать.
-Ответ приходит как reply на сообщение пользователя. Характер — мудрый старейшина.
+Ответ приходит как reply на сообщение пользователя. Наблюдает за сроками: при истечении срока суда действует по закону.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from discord import Message  # type: ignore[reportMissingImports]
 from discord.ext import commands  # type: ignore[reportMissingImports]
+from sqlalchemy import select, update  # type: ignore[reportMissingImports]
 
 from src.core.agent import Agent
 from src.core.agent_ctx import AgentContext
@@ -110,6 +113,93 @@ class ElderBot(RoleBot):
             logger.info("Старейшина: inbox канал %s (читает все сообщения, сам решает кому отвечать)", self._inbox_channel_id)
         if self._watch_channel_ids:
             logger.info("Старейшина: надзор за каналами %s (проверка легитимности действий)", self._watch_channel_ids)
+        self.loop.create_task(self._deadline_watch_loop())
+
+    async def _deadline_watch_loop(self) -> None:
+        """Фоновое наблюдение за сроками: раз в N минут проверяем дела с истёкшим сроком суда, подгружаем закон, действуем по закону."""
+        interval_min = 15
+        rcfg = self.config.role_config(self.role_key)
+        if isinstance(rcfg, dict) and "deadline_check_interval_minutes" in rcfg:
+            try:
+                interval_min = max(1, int(rcfg["deadline_check_interval_minutes"]))
+            except (TypeError, ValueError):
+                pass
+        await self.wait_until_ready()
+        logger.info("Старейшина: наблюдение за сроками суда включено (интервал %s мин)", interval_min)
+        while True:
+            try:
+                await asyncio.sleep(interval_min * 60)
+                await self._check_expired_deadlines()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception("Старейшина: ошибка в цикле наблюдения за сроками: %s", e)
+
+    async def _check_expired_deadlines(self) -> None:
+        """Найти дела с истёкшим сроком суда (без эскалации), подгрузить закон из двух каналов, вызвать агента для действий по закону."""
+        guild_id = self.config.guild_id
+        if not guild_id:
+            return
+        now = datetime.now(timezone.utc)
+        async with get_db() as session:
+            result = await session.execute(
+                select(ElderCase).where(
+                    ElderCase.guild_id == guild_id,
+                    ElderCase.status == "open",
+                    ElderCase.sent_to_court_at.isnot(None),
+                    ElderCase.deadline_escalation_at.is_(None),
+                )
+            )
+            cases = result.scalars().all()
+        to_escalate = []
+        for c in cases:
+            hours = c.court_deadline_hours or 24
+            sent_at = c.sent_to_court_at
+            if not sent_at:
+                continue
+            sent_utc = sent_at.replace(tzinfo=timezone.utc) if sent_at.tzinfo is None else sent_at
+            if (now - sent_utc) > timedelta(hours=hours):
+                to_escalate.append(c)
+        if not to_escalate:
+            return
+        law_block = await get_law_block_async(
+            self, guild_id, max_chars=12000,
+            reference_category_name=getattr(self.config, "reference_category_name", None) or "право",
+            config=self.config,
+        )
+        for case in to_escalate:
+            try:
+                await self._escalate_expired_case(case, law_block)
+            except Exception as e:
+                logger.exception("Старейшина: эскалация по делу №%s: %s", case.id, e)
+
+    async def _escalate_expired_case(self, case: ElderCase, law_block: str) -> None:
+        """По одному делу с истёкшим сроком: агент читает закон, уведомляет суд и действует по закону. После — помечаем эскалацию."""
+        guild_id = self.config.guild_id
+        hours = case.court_deadline_hours or 24
+        sent_at = str(case.sent_to_court_at) if case.sent_to_court_at else "—"
+        user_content = (
+            "[ РЕЖИМ НАБЛЮДЕНИЯ ЗА СРОКАМИ ]\n\n"
+            f"Дело №{case.id} (тип: {case.case_type}) передано в суд {sent_at}. Срок для суда: {hours} ч. **Срок истёк, суд не вынес решение.**\n\n"
+            "По закону из блока выше (закон загружен из каналов базы и судебных прецедентов):\n"
+            "1) Уведоми канал суда (notify_court) о том, что срок на рассмотрение по делу №{case.id} истёк и суд не вынес решение.\n"
+            "2) Дальше действуй только по закону: какие ещё шаги предписаны (при необходимости publish_decision или иное)? Вызови нужные инструменты.\n"
+            "Не придумывай — опирайся на текст закона в блоке выше."
+        )
+        messages_for_llm = [
+            {"role": "user", "content": law_block + "\n\n---\n\n" + user_content},
+        ]
+        ctx = self._agent_context(guild_id, extra={"current_case_id": case.id})
+        agent = self._build_agent(ctx)
+        await agent.run(messages_for_llm)
+        now = datetime.now(timezone.utc)
+        async with get_db() as session:
+            await session.execute(
+                update(ElderCase)
+                .where(ElderCase.id == case.id, ElderCase.guild_id == guild_id)
+                .values(deadline_escalation_at=now)
+            )
+        logger.info("Старейшина: по делу №%s зафиксирована эскалация (срок истёк)", case.id)
 
     async def on_message(self, message: Message) -> None:
         if message.author.bot:

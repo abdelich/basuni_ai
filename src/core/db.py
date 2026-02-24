@@ -48,8 +48,12 @@ async def async_init_db() -> None:
     import src.core.models  # noqa: F401 — регистрируем таблицы в Base.metadata
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Миграция: поля учёта срока суда (если таблица elder_cases уже существовала)
-        for col, typ in [("sent_to_court_at", "DATETIME"), ("court_deadline_hours", "INTEGER")]:
+        # Миграция: поля учёта срока суда и эскалации (если таблица elder_cases уже существовала)
+        for col, typ in [
+            ("sent_to_court_at", "DATETIME"),
+            ("court_deadline_hours", "INTEGER"),
+            ("deadline_escalation_at", "DATETIME"),
+        ]:
             try:
                 await conn.execute(text(f"ALTER TABLE elder_cases ADD COLUMN {col} {typ}"))
             except Exception:
