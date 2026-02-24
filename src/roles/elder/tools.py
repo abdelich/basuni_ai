@@ -72,10 +72,12 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                 return await get_member_roles_json_async(ctx.bot, ctx.guild_id, str(author_id))
         return await get_member_roles_json_async(ctx.bot, ctx.guild_id, member_query)
 
-    async def get_all_law_channel_contents(category_substring: str = "право", limit_per_channel: int = 40) -> str:
-        """Получить и прочитать содержимое всех текстовых каналов из категории «право» (название может быть с эмодзи, например «📜 право»). Один вызов — все каналы: правила, прецеденты, закон. Используй перед ответом по существу, чтобы опираться на закон."""
+    async def get_all_law_channel_contents(category_substring: str = "право", limit_per_channel: int = 80) -> str:
+        """Получить содержимое каналов категории «право» как один документ (статьи и части в соседних абзацах). Используй для поиска «статья N часть M» — отвечай только по этому тексту."""
         sub = getattr(ctx.bot, "config", None) and getattr(ctx.bot.config, "reference_category_name", None) or category_substring
-        return await get_all_reference_channel_contents_async(ctx.bot, ctx.guild_id, sub, min(limit_per_channel, 50))
+        return await get_all_reference_channel_contents_async(
+            ctx.bot, ctx.guild_id, sub, min(limit_per_channel, 120), as_law_document=True
+        )
 
     async def get_channel_content(channel_id: int, limit: int = 40) -> str:
         """Прочитать содержимое канала (закреплённые и последние сообщения). channel_id бери из get_channels или get_reference_channels — заходи в те каналы, которые тебе нужны по смыслу (прецеденты, закон)."""

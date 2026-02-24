@@ -188,38 +188,54 @@ def get_member_roles_json(bot: Any, guild_id: int, query: str) -> str:
     return json.dumps(matches, ensure_ascii=False, indent=0)
 
 
-async def get_channel_content_async(bot: Any, channel_id: int, limit: int = 40) -> str:
+async def get_channel_content_async(
+    bot: Any,
+    channel_id: int,
+    limit: int = 40,
+    as_law_document: bool = False,
+) -> str:
     """
-    Читает сообщения из канала (сначала закреплённые, затем последние). Для каналов категории «право» — прецеденты и закон.
-    Возвращает текст для ссылки агентом на закон. Общая логика для всех агентов.
+    Читает сообщения из канала (сначала закреплённые, затем последние).
+    as_law_document=True: для каналов закона — без префиксов автора, сообщения склеиваются в один текст по порядку,
+    чтобы «Статья 5» и «Часть 3» в разных сообщениях читались как один документ. Увеличивается лимит сообщений.
     """
     channel = bot.get_channel(int(channel_id))
     if not channel:
         return json.dumps({"error": f"Канал {channel_id} не найден."})
+    if as_law_document:
+        limit = min(limit, 120)
     lines = []
     try:
         pins = await channel.pins()
-        for msg in pins[:15]:
-            author = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "?")
+        for msg in pins[:20] if as_law_document else pins[:15]:
             content = (msg.content or "").strip()
             if content:
-                lines.append(f"[Закреплено | {author}]: {content[:800]}")
+                if as_law_document:
+                    lines.append(content[:1200])
+                else:
+                    author = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "?")
+                    lines.append(f"[Закреплено | {author}]: {content[:800]}")
         count = 0
         async for msg in channel.history(limit=limit, oldest_first=True):
             if msg.pinned:
                 continue
-            author = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "?")
             content = (msg.content or "").strip()
             if not content:
                 continue
-            lines.append(f"[{author}]: {content[:800]}")
+            if as_law_document:
+                lines.append(content[:1200])
+            else:
+                author = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", "?")
+                lines.append(f"[{author}]: {content[:800]}")
             count += 1
-            if count >= 35:
+            if not as_law_document and count >= 35:
                 break
     except Exception as e:
         return json.dumps({"error": f"Не удалось прочитать канал: {e!r}"})
     if not lines:
         return "В канале нет сообщений или нет доступа на чтение."
+    if as_law_document:
+        return "\n\n".join(lines)
     return "\n---\n".join(lines)
 
 
@@ -228,12 +244,12 @@ async def get_all_reference_channel_contents_async(
     guild_id: int,
     category_substring: str = "право",
     limit_per_channel: int = 40,
+    as_law_document: bool = False,
 ) -> str:
     """
     Получить и прочитать содержимое всех текстовых каналов из категории, в названии которой есть
-    category_substring (например «право» или «📜 право»). Возвращает один текст: по каждому каналу
-    блок с заголовком «=== название канала (id) ===» и содержимым (закреплённые + последние сообщения).
-    Для агентов: закон и прецеденты в одном вызове.
+    category_substring. as_law_document=True: сообщения без префикса автора, склеены как один документ
+    (статьи и части в разных сообщениях читаются подряд) — для точного поиска «статья N часть M».
     """
     guild = bot.get_guild(guild_id)
     if not guild:
@@ -246,9 +262,10 @@ async def get_all_reference_channel_contents_async(
             channels.append({"id": ch.id, "name": ch.name})
     if not channels:
         return "В категории с подстрокой «право» в названии нет текстовых каналов."
+    lim = min(limit_per_channel, 120) if as_law_document else min(limit_per_channel, 50)
     parts = []
     for c in channels:
-        content = await get_channel_content_async(bot, c["id"], limit=min(limit_per_channel, 50))
+        content = await get_channel_content_async(bot, c["id"], limit=lim, as_law_document=as_law_document)
         if content.startswith("{") and "error" in content:
             parts.append(f"=== {c['name']} (id: {c['id']}) ===\n[не удалось прочитать: {content}]")
         else:
@@ -335,9 +352,10 @@ async def get_law_block_async(
     priority_ids: list[int] = []
     if config is not None and hasattr(config, "law_channel_ids") and callable(getattr(config, "law_channel_ids")):
         priority_ids = list(config.law_channel_ids())
+    law_limit = 100
     for i, ch_id in enumerate(priority_ids):
         label = _LAW_PRIORITY_LABELS[i] if i < len(_LAW_PRIORITY_LABELS) else f"Канал {ch_id}"
-        ch_content = await get_channel_content_async(bot, ch_id, limit=50)
+        ch_content = await get_channel_content_async(bot, ch_id, limit=law_limit, as_law_document=True)
         if ch_content.startswith("{") and "error" in ch_content:
             parts.append(f"=== {label} (id: {ch_id}) ===\n[не удалось прочитать]")
         else:
@@ -347,7 +365,7 @@ async def get_law_block_async(
                 ch_name = getattr(ch, "name", "")
             parts.append(f"=== {label}" + (f" — {ch_name}" if ch_name else "") + f" (id: {ch_id}) ===\n{ch_content}")
     rest = await get_all_reference_channel_contents_async(
-        bot, guild_id, reference_category_name, limit_per_channel=50
+        bot, guild_id, reference_category_name, limit_per_channel=law_limit, as_law_document=True
     )
     if rest.startswith("{") and "error" in rest:
         if not parts:
@@ -364,7 +382,7 @@ async def get_law_block_async(
                         continue
                     if ch.id in rest_ids:
                         continue
-                    cnt = await get_channel_content_async(bot, ch.id, limit=50)
+                    cnt = await get_channel_content_async(bot, ch.id, limit=law_limit, as_law_document=True)
                     if cnt.startswith("{") and "error" in cnt:
                         other_parts.append(f"=== {ch.name} (id: {ch.id}) ===\n[не удалось прочитать]")
                     else:
@@ -376,4 +394,9 @@ async def get_law_block_async(
     content = "\n\n".join(parts)
     if len(content) > max_chars:
         content = content[:max_chars] + "\n[... обрезано ...]"
-    return f"Закон и прецеденты (все агенты действуют только по закону):\n{content}"
+    hint = (
+        "Закон и прецеденты (все агенты действуют только по закону). "
+        "Текст собран из сообщений каналов по порядку: статьи и части могут быть в соседних абзацах. "
+        "На запрос «статья N часть M» ищи в тексте ниже именно Статью N и Часть M, отвечай только по этому тексту.\n\n"
+    )
+    return hint + content
