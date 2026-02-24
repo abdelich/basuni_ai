@@ -121,11 +121,8 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             return f"Ошибка отправки в совет: {e!r}"
 
     async def publish_decision(case_id: str, decision: str, reasoning: str) -> str:
-        """Опубликовать решение старейшин: confirm_process, send_to_council или return_to_court. По одному делу — только один раз. Сообщение уходит в канал решений и дело закрывается в БД. case_id — именно номер дела (число из «Обращение №N» или из list_elder_cases), не описание."""
-        from src.roles.elder.logic import elder_may_decide
-        if not elder_may_decide(decision):
-            return f"Недопустимое решение для старейшин: {decision}"
-
+        """Опубликовать решение старейшин. По референдуму — только referendum_approved (дальше в суд по закону) или referendum_rejected (дело закрыто, больше по нему ничего не делается). По апелляции: confirm_process, send_to_council, return_to_court. По одному делу — только один раз. case_id — номер дела (число из «Обращение №N» или list_elder_cases)."""
+        from src.roles.elder.logic import elder_may_decide, elder_may_decide_for_case
         try:
             cid = int(case_id)
         except (ValueError, TypeError):
@@ -136,6 +133,10 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             case = result.scalars().one_or_none()
             if not case:
                 return f"Дело №{case_id} не найдено."
+            if not elder_may_decide(decision):
+                return f"Недопустимое решение для старейшин: {decision}"
+            if not elder_may_decide_for_case(decision, case.case_type):
+                return f"По делу типа «{case.case_type}» допустимы только: для референдума — referendum_approved или referendum_rejected; для апелляции — confirm_process, send_to_council, return_to_court."
             if case.elder_already_decided:
                 return "По этому делу старейшины уже выносили решение; повторное вмешательство не допускается (Статья IV, п. 6)."
 
@@ -152,18 +153,25 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             else:
                 return "В конфиге не задан канал для решений (decisions). Используй get_channels и send_message_to_channel для публикации в нужный канал."
 
+            # По референдуму одобренное — оставляем open, чтобы после notify_court + record_case_sent_to_court дело попадало в list_cases_pending_court для отслеживания; остальное — закрываем
+            new_status = "open" if decision == "referendum_approved" else "closed"
             await session.execute(
                 update(ElderCase)
                 .where(ElderCase.id == cid)
                 .values(
-                    status="closed",
+                    status=new_status,
                     elder_decided_at=datetime.utcnow(),
                     elder_decision=decision,
                     elder_reasoning=reasoning,
                     elder_already_decided=True,
                 )
             )
-            return "Решение опубликовано и зафиксировано в деле."
+            out = "Решение опубликовано и зафиксировано в деле."
+            if decision == "referendum_approved":
+                out += " Обязательно вызови notify_court(содержимое) по этому делу и затем record_case_sent_to_court(case_id) — чтобы дело пошло в суд по закону и начался отсчёт срока; дело остаётся в отслеживании (list_cases_pending_court)."
+            elif decision == "referendum_rejected":
+                out += " Дело по референдуму закрыто; дальше по нему никаких действий не производится."
+            return out
 
     async def get_case(case_id: str) -> str:
         """Получить данные дела старейшин по номеру (число из «Обращение №N» или list_elder_cases)."""
@@ -367,10 +375,10 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
         ),
         Tool(
             name="publish_decision",
-            description="Опубликовать решение старейшин по делу: confirm_process (подтвердить процесс), send_to_council (на исполнение в совет), return_to_court (вернуть в суд с указанием нарушения). По одному делу допускается только один раз. Сообщение уходит в канал решений, дело закрывается в БД.",
+            description="Опубликовать решение старейшин. По референдуму — только referendum_approved (одобрено, дальше в суд; затем notify_court и record_case_sent_to_court) или referendum_rejected (отклонено, дело закрыто навсегда). По апелляции: confirm_process, send_to_council, return_to_court. По одному делу — один раз.",
             parameters=build_parameters({
                 "case_id": ("string", "Номер дела"),
-                "decision": ("string", "confirm_process | send_to_council | return_to_court"),
+                "decision": ("string", "referendum_approved | referendum_rejected (референдум) или confirm_process | send_to_council | return_to_court (апелляция)"),
                 "reasoning": ("string", "Краткое обоснование"),
             }),
             execute=publish_decision,
