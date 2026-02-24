@@ -28,6 +28,8 @@ logger = logging.getLogger("basuni.elder.bot")
 
 # Если агент вернёт ровно это — ответ в Discord не отправляем (старейшина решил не отвечать)
 SKIP_REPLY_MARKER = "НЕТ"
+# В режиме надзора: если агент вернёт это — действие легитимно, в канал ничего не постим
+LEGITIMATE_MARKER = "ЛЕГИТИМНО"
 
 
 def _has_pmj_role(message: Message, pmj_role_id: int | None) -> bool:
@@ -72,6 +74,7 @@ class ElderBot(RoleBot):
     def __init__(self, deps: RoleDeps, **kwargs: object) -> None:
         super().__init__(role_key="elder", deps=deps, command_prefix="!", **kwargs)
         self._inbox_channel_id: int | None = None
+        self._watch_channel_ids: list[int] = []
 
     def _agent_context(self, guild_id: int, extra: dict[str, Any] | None = None) -> AgentContext:
         cfg = self.config
@@ -102,20 +105,30 @@ class ElderBot(RoleBot):
     async def setup_hook(self) -> None:
         await super().setup_hook()
         self._inbox_channel_id = self.config.channel_for_role(self.role_key, "inbox")
+        self._watch_channel_ids = self.config.watch_channel_ids(self.role_key)
         if self._inbox_channel_id:
             logger.info("Старейшина: inbox канал %s (читает все сообщения, сам решает кому отвечать)", self._inbox_channel_id)
+        if self._watch_channel_ids:
+            logger.info("Старейшина: надзор за каналами %s (проверка легитимности действий)", self._watch_channel_ids)
 
     async def on_message(self, message: Message) -> None:
         if message.author.bot:
             await self.process_commands(message)
             return
 
-        inbox_id = self._inbox_channel_id or self.config.channel_for_role(self.role_key, "inbox")
-        if not inbox_id or message.channel.id != inbox_id:
+        guild = message.guild
+        channel_id = message.channel.id
+
+        # Надзор: сообщение в отслеживаемом канале (суд, совет) — проверяем легитимность действия
+        if guild and self._watch_channel_ids and channel_id in self._watch_channel_ids:
+            await self._handle_oversight(message)
             await self.process_commands(message)
             return
 
-        guild = message.guild
+        inbox_id = self._inbox_channel_id or self.config.channel_for_role(self.role_key, "inbox")
+        if not inbox_id or channel_id != inbox_id:
+            await self.process_commands(message)
+            return
         if not guild:
             await self.process_commands(message)
             return
@@ -158,7 +171,9 @@ class ElderBot(RoleBot):
             await self.process_commands(message)
             return
 
-        history = await load_recent_messages(self.role_key, guild.id, channel_id, thread_id, limit=20)
+        history = await load_recent_messages(
+            self.role_key, guild.id, channel_id, thread_id, limit=20, author_id=message.author.id
+        )
         author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "") or "Гражданин"
         # Роли обратившегося: передаём member из сообщения, чтобы данные были точными (не зависят от fetch_member/Intent)
         author_block, author_role_names = await get_author_roles_block_async(
@@ -247,6 +262,54 @@ class ElderBot(RoleBot):
             )
 
         await self.process_commands(message)
+
+    async def _handle_oversight(self, message: Message) -> None:
+        """Проверка легитимности действия в канале надзора (суд, совет). При нелегитимности — пост прерывания в канал."""
+        guild = message.guild
+        if not guild:
+            return
+        content = (message.content or "").strip()
+        if not content:
+            return
+        author_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "") or "?"
+        channel_name = getattr(message.channel, "name", str(message.channel.id))
+        author_block, author_role_names = await get_author_roles_block_async(
+            self, guild.id, message.author.id, author_name,
+            member=getattr(message.author, "roles", None) and message.author or None,
+        )
+        law_block = await get_law_block_async(
+            self, guild.id, max_chars=8000,
+            reference_category_name=getattr(self.config, "reference_category_name", None) or "право",
+        )
+        oversight_user = (
+            law_block + "\n\n---\n\n"
+            + "[ РЕЖИМ НАДЗОРА ]\n"
+            + f"Канал: {channel_name} (id={message.channel.id}).\n"
+            + author_block
+            + f"\nСообщение участника: {content[:1500]}\n\n"
+            "Проверь: 1) соответствие закону 2) есть ли у автора право на это действие (роли) 3) легитимность процедуры. "
+            "Если легитимно — ответь ровно: ЛЕГИТИМНО. Если нелегитимно — ответь одним сообщением для постинга в канал: прерывание процедуры, указание нарушения, ссылка на закон."
+        )
+        agent_ctx = self._agent_context(guild.id, extra={"author_id": message.author.id})
+        agent = self._build_agent(agent_ctx)
+        try:
+            reply = await agent.run([{"role": "user", "content": oversight_user}])
+        except Exception as e:
+            logger.exception("Ошибка агента надзора старейшины")
+            return
+        reply_clean = (reply or "").strip()
+        if reply_clean.upper() == LEGITIMATE_MARKER:
+            return
+        if not reply_clean:
+            return
+        try:
+            await message.reply(reply_clean[:2000])
+        except Exception as e:
+            logger.exception("Не удалось отправить прерывание надзора")
+            try:
+                await message.channel.send(reply_clean[:2000])
+            except Exception:
+                pass
 
 
 def create_elder_bot(deps: RoleDeps) -> RoleBot:

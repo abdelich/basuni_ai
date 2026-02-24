@@ -10,8 +10,7 @@ channels:
   # Старейшины: приём заявок, публикация решений, уведомления
   elder_inbox: 1475109427425050694
   elder_decisions: 1474353883018170509
-  # Остальные инстанции
-  court_inbox: 1474409653638004960
+  court_inbox: 1474352267996958823
   council_inbox: 1474356901650366496
   prosecutor_inbox: 1474357751873405064
   kpp_inbox: 1474368849758650452
@@ -30,7 +29,7 @@ role_ids:
   judge: 1474393550866350151
 
 # Категория «право»: её подканалы содержат прецеденты и закон. Все агенты должны её читать и ссылаться на закон при необходимости.
-reference_category_name: "право"
+reference_category_name: "📜 право"
 
 # Какие боты запускать (ключи: elder, council, prosecutor, kpp, judge)
 enabled_roles:
@@ -40,10 +39,15 @@ enabled_roles:
 # xxx_channel_key — ключ из блока channels выше
 roles:
   elder:
+    # Срок (часов), за который суд должен принять решение по переданному делу (оба судьи). По истечении старейшина решает по закону.
+    court_deadline_hours: 24
     inbox_channel_key: elder_inbox      # куда граждане пишут заявки
     decisions_channel_key: elder_decisions  # куда бот публикует решения
     outbox_channel_key: elder_inbox     # куда отвечать по умолчанию (можно тред)
     notify_court_channel_key: court_inbox
     notify_council_channel_key: council_inbox
     referrals_channel_key: referrals
-    may_notify_channel_keys: [court_inbox, council_inbox]
+    # Каналы надзора: при каждом сообщении старейшина проверяет легитимность действия (суд, совет, прокурор, КПП, рефералы)
+    watch_channel_keys: [court_inbox, council_inbox, prosecutor_inbox, kpp_inbox, referrals]
+    # Зарезервировано: каналы, в которые старейшина может отправлять уведомления (в коде пока не используется)
+    may_notify_channel_keys: [elder_inbox, elder_decisions, court_inbox, council_inbox, prosecutor_inbox, kpp_inbox, referrals]

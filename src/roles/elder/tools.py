@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select, update  # type: ignore[reportMissingImports]
@@ -184,6 +184,18 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                     meta = json.loads(case.meta)
                 except Exception:
                     meta = {"raw": case.meta}
+            deadline_hours = case.court_deadline_hours
+            if deadline_hours is None:
+                try:
+                    deadline_hours = int(ctx.bot.config.role_config("elder").get("court_deadline_hours", 24))
+                except (TypeError, ValueError):
+                    deadline_hours = 24
+            sent_at = case.sent_to_court_at
+            deadline_passed = False
+            if sent_at and deadline_hours:
+                now = datetime.now(timezone.utc)
+                sent_utc = sent_at.replace(tzinfo=timezone.utc) if sent_at.tzinfo is None else sent_at
+                deadline_passed = (now - sent_utc) > timedelta(hours=deadline_hours)
             return json.dumps({
                 "id": case.id,
                 "case_type": case.case_type,
@@ -193,8 +205,67 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                 "created_at": str(case.created_at),
                 "elder_already_decided": case.elder_already_decided,
                 "elder_decision": case.elder_decision,
+                "sent_to_court_at": str(sent_at) if sent_at else None,
+                "court_deadline_hours": case.court_deadline_hours or deadline_hours,
+                "court_deadline_passed": deadline_passed,
                 **meta,
             }, ensure_ascii=False, indent=0)
+
+    async def record_case_sent_to_court(case_id: str) -> str:
+        """Зафиксировать, что дело передано в суд — начать отсчёт срока по закону. Вызывай после notify_court по этому делу. Срок (часов) берётся из конфига/закона."""
+        try:
+            cid = int(case_id)
+        except (ValueError, TypeError):
+            return "Ошибка: укажи номер дела числом."
+        deadline_hours = 24
+        try:
+            rcfg = ctx.bot.config.role_config("elder")
+            if isinstance(rcfg, dict):
+                deadline_hours = int(rcfg.get("court_deadline_hours", 24))
+        except Exception:
+            pass
+        async with ctx.db_session_factory() as session:
+            result = await session.execute(select(ElderCase).where(ElderCase.id == cid, ElderCase.guild_id == ctx.guild_id))
+            case = result.scalars().one_or_none()
+            if not case:
+                return f"Дело №{case_id} не найдено."
+            now = datetime.now(timezone.utc)
+            await session.execute(
+                update(ElderCase)
+                .where(ElderCase.id == cid, ElderCase.guild_id == ctx.guild_id)
+                .values(sent_to_court_at=now, court_deadline_hours=deadline_hours)
+            )
+        return f"Отсчёт срока для суда по делу №{case_id} начат. Срок: {deadline_hours} ч. По истечении старейшина решает по закону."
+
+    async def list_cases_pending_court() -> str:
+        """Список дел, переданных в суд и ожидающих решения: id, case_type, sent_to_court_at, срок (ч), истёк ли срок. Используй для контроля времени по закону — если срок истёк, решай по закону, что делать с делом."""
+        async with ctx.db_session_factory() as session:
+            result = await session.execute(
+                select(ElderCase)
+                .where(
+                    ElderCase.guild_id == ctx.guild_id,
+                    ElderCase.status == "open",
+                    ElderCase.sent_to_court_at.isnot(None),
+                )
+            )
+            cases = result.scalars().all()
+        if not cases:
+            return "Нет дел, переданных в суд и ожидающих решения."
+        now = datetime.now(timezone.utc)
+        out = []
+        for c in cases:
+            sent_at = c.sent_to_court_at
+            hours = c.court_deadline_hours or 24
+            sent_utc = sent_at.replace(tzinfo=timezone.utc) if sent_at and sent_at.tzinfo is None else sent_at
+            passed = (now - sent_utc) > timedelta(hours=hours) if sent_utc else False
+            out.append({
+                "id": c.id,
+                "case_type": c.case_type,
+                "sent_to_court_at": str(sent_at),
+                "court_deadline_hours": hours,
+                "deadline_passed": passed,
+            })
+        return json.dumps(out, ensure_ascii=False, indent=0)
 
     async def list_elder_cases(status: str = "open") -> str:
         """Список дел старейшин по статусу (open или closed)."""
@@ -315,5 +386,17 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             description="Список дел у старейшин по статусу (open или closed).",
             parameters=build_parameters({"status": ("string", "Статус дела: open или closed")}, required=[]),
             execute=list_elder_cases,
+        ),
+        Tool(
+            name="record_case_sent_to_court",
+            description="Зафиксировать передачу дела в суд и начать отсчёт срока по закону. Вызывай после notify_court по этому делу. Срок (часов) берётся из конфига.",
+            parameters=build_parameters({"case_id": ("string", "Номер дела (Обращение №N)")}, required=["case_id"]),
+            execute=record_case_sent_to_court,
+        ),
+        Tool(
+            name="list_cases_pending_court",
+            description="Дела, переданные в суд и ожидающие решения: id, тип, когда передано, срок (ч), истёк ли срок. Для контроля времени — если срок истёк, решай по закону.",
+            parameters=build_parameters({}, required=[]),
+            execute=list_cases_pending_court,
         ),
     ]

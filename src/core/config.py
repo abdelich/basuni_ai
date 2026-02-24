@@ -98,6 +98,13 @@ class Config:
         channels = self.channels()
         return channels.get(channel_key) if isinstance(channel_key, str) else None
 
+    def watch_channel_ids(self, role_key: str) -> list[int]:
+        """ID каналов, которые роль отслеживает для надзора за легитимностью (например суд, совет). В YAML: roles.<role>.watch_channel_keys."""
+        rcfg = self.role_config(role_key)
+        keys = rcfg.get("watch_channel_keys") or []
+        ch = self.channels()
+        return [ch[k] for k in keys if isinstance(k, str) and ch.get(k)]
+
     @property
     def reference_category_name(self) -> str:
         """Название категории Discord, в которой лежат прецеденты и закон (подканалы). Все агенты читают её и ссылаются на закон при необходимости."""
