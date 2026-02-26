@@ -11,9 +11,9 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-# Загружаем .env из корня проекта
+# Загружаем .env из корня проекта; override=True — значения из .env имеют приоритет над переменными окружения системы/терминала
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 
 def _env(key: str, default: str | None = None) -> str:
@@ -55,8 +55,13 @@ class Config:
 
     @property
     def openai_model(self) -> str:
-        """Модель OpenAI для агентов. По умолчанию gpt-4o-mini."""
-        return _env_optional("OPENAI_MODEL") or self._raw.get("openai_model") or "gpt-4o-mini"
+        """Модель для агентов (OpenAI или другая при base_url). По умолчанию gpt-4o — лучше соблюдает инструкции и логику (сроки, дела суда). Для экономии можно задать gpt-4o-mini."""
+        return _env_optional("OPENAI_MODEL") or self._raw.get("openai_model") or "gpt-4o"
+
+    @property
+    def openai_base_url(self) -> str | None:
+        """Базовый URL API (OpenRouter, локальная модель и т.д.). Если задан — запросы идут туда вместо api.openai.com."""
+        return _env_optional("OPENAI_BASE_URL") or self._raw.get("openai_base_url")
 
     # --- Структура из YAML ---
     @property
@@ -93,6 +98,8 @@ class Config:
             "notify_court": rcfg.get("notify_court_channel_key") or "court_inbox",
             "notify_council": rcfg.get("notify_council_channel_key") or "council_inbox",
             "referrals": rcfg.get("referrals_channel_key") or "referrals",
+            "deliberations": rcfg.get("deliberations_channel_key") or "council_deliberations",
+            "court_decisions": rcfg.get("court_decisions_channel_key") or "court_decisions",
         }
         channel_key = key_map.get(purpose) or purpose
         channels = self.channels()

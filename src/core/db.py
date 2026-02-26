@@ -51,11 +51,35 @@ async def async_init_db() -> None:
         # Миграция: поля учёта срока суда и эскалации (если таблица elder_cases уже существовала)
         for col, typ in [
             ("sent_to_court_at", "DATETIME"),
+            ("sent_to_court_content", "TEXT"),
             ("court_deadline_hours", "INTEGER"),
+            ("court_deadline_minutes", "INTEGER"),
+            ("court_deadline_expired_at", "DATETIME"),
             ("deadline_escalation_at", "DATETIME"),
+            ("court_decided_at", "DATETIME"),
+            ("court_result", "VARCHAR(32)"),
+            ("returned_to_elder_at", "DATETIME"),
+            ("returned_to_elder_reason", "TEXT"),
         ]:
             try:
                 await conn.execute(text(f"ALTER TABLE elder_cases ADD COLUMN {col} {typ}"))
+            except Exception:
+                pass
+        # Разово: отметить «срок истёк» у всех дел, переданных в суд и ещё ожидающих решения (не помеченных)
+        try:
+            await conn.execute(text(
+                "UPDATE elder_cases SET court_deadline_expired_at = CURRENT_TIMESTAMP "
+                "WHERE sent_to_court_at IS NOT NULL AND court_decided_at IS NULL AND court_deadline_expired_at IS NULL"
+            ))
+        except Exception:
+            pass
+        # Легитимность в отчёте надзора: галочка/крестик старейшины
+        for col, typ in [
+            ("legitimacy", "VARCHAR(16)"),
+            ("legitimacy_at", "DATETIME"),
+        ]:
+            try:
+                await conn.execute(text(f"ALTER TABLE elder_court_log ADD COLUMN {col} {typ}"))
             except Exception:
                 pass
 

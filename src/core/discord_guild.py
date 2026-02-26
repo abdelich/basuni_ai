@@ -82,6 +82,26 @@ def get_channels_where_category_contains(bot: Any, guild_id: int, category_subst
     return json.dumps(out, ensure_ascii=False, indent=0)
 
 
+def get_guild_emojis_json(bot: Any, guild_id: int) -> str:
+    """
+    Список кастомных эмодзи сервера: name, id, строка для реакции.
+    Старейшина может ставить реакции любым из этих эмодзи (особенно на одобрение/неодобрение судей).
+    """
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return json.dumps({"error": "Гильдия не найдена."})
+    emojis = []
+    for em in guild.emojis:
+        # Для реакции в discord.py передаётся объект Emoji или строка :name:id
+        emojis.append({
+            "name": em.name,
+            "id": em.id,
+            "reaction_string": str(em),  # <:name:id> для кастомных
+            "animated": getattr(em, "animated", False),
+        })
+    return json.dumps(emojis, ensure_ascii=False, indent=0)
+
+
 def get_guild_roles_and_members_json(bot: Any, guild_id: int) -> str:
     """
     Возвращает JSON со всеми ролями гильдии и участниками в каждой роли: id, name, members (id, display_name).
@@ -395,8 +415,9 @@ async def get_law_block_async(
     if len(content) > max_chars:
         content = content[:max_chars] + "\n[... обрезано ...]"
     hint = (
-        "Закон и прецеденты (все агенты действуют только по закону). "
-        "Текст собран из сообщений каналов по порядку: статьи и части могут быть в соседних абзацах. "
-        "На запрос «статья N часть M» ищи в тексте ниже именно Статью N и Часть M, отвечай только по этому тексту.\n\n"
+        "Закон и прецеденты (действуй только по закону). "
+        "Блок собран из двух каналов закона (конфиг: law_base_precedents, law_judicial_precedents) и остальных каналов категории «право». "
+        "На запрос про статью N (или часть M) ищи в тексте ниже именно эту статью/часть и отвечай только по этому тексту. "
+        "Если не нашёл — используй инструменты get_all_law_channel_contents() или get_channel_content(channel_id).\n\n"
     )
     return hint + content

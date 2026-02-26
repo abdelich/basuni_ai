@@ -10,8 +10,12 @@ channels:
   # Старейшины: приём заявок, публикация решений, уведомления
   elder_inbox: 1475109427425050694
   elder_decisions: 1474353883018170509
-  court_inbox: 1474352267996958823
+  court_inbox: 1474409653638004960
+  # Канал, откуда совет читает решения суда (если нужно исполнить — исполняют; если только теория — ничего не делают). Подставь ID канала.
+  court_decisions: 1474393461078753451
   council_inbox: 1474356901650366496
+  # Канал, куда трое членов совета пишут мысли и голоса (только «За» или «Против», без воздержаний).
+  council_deliberations: 1475987043849994250
   prosecutor_inbox: 1474357751873405064
   kpp_inbox: 1474368849758650452
   referrals: 1475128588167680062
@@ -39,25 +43,58 @@ law_channels:
   base_precedents_key: law_base_precedents
   judicial_precedents_key: law_judicial_precedents
 
-# Какие боты запускать (ключи: elder, council, prosecutor, kpp, judge)
+# Модель и API (по умолчанию из .env: OPENAI_API_KEY, OPENAI_MODEL). Для старейшины лучше gpt-4o — точнее соблюдает сроки и инструкции; gpt-4o-mini дешевле, но может путать логику.
+openai_model: gpt-4o-mini
+# openai_base_url: https://openrouter.ai/api/v1
+# openai_model: meta-llama/llama-3.1-70b-instruct
+
+# Какие боты запускать (ключи: elder, council_1, council_2, council_3, prosecutor, kpp, judge)
 enabled_roles:
   - elder
+  - council_1
+  - council_2
+  - council_3
 
 # Привязка каналов и опции по ролям
 # xxx_channel_key — ключ из блока channels выше
 roles:
   elder:
-    # Срок (часов), за который суд должен принять решение по переданному делу (оба судьи). По истечении старейшина решает по закону.
-    court_deadline_hours: 24
+    # Фразы, которые бот пишет сразу, пока ждёт ответ API (при 429 или долгом запросе). Если не задано — используются встроенные.
+    thinking_phrases: ["Дай подумать…", "Сейчас посмотрю справочники…", "Не торопи, подумаю и отвечу.", "Минутку, разбираю обращение.", "Минутку, подумаю…", "Да подожди блядь, заебал."]
+    # При длине сообщения > 40 символов бот отвечает только одной фразой из thinking_phrases, без вызова модели.
+    thinking_only_over_chars: 40
+    # Когда старейшина решил не отвечать (обращение не к нему) — отправить одну из этих фраз. Если не задано — встроенный список.
+    skip_reply_phrases: ["Поконкретнее будь", "Это не ко мне.", "Пошел нахуй с таким", "Теряйся в страхе", "Я сейчас занят", "Не смогу помочь", "Я не знаю, что делать", "Я пока какаю, не могу дать ответ, посерьезнее подвигайся чуть."]
+    # Срок, за который суд должен принять решение (оба судьи). Часы, можно дробное: 0.25 = 15 мин, 1 = 1 ч, 24 = 1 сут. По истечении старейшина решает по закону.
+    court_deadline_hours: 0.25
     # Интервал (минут) проверки дел с истёкшим сроком суда: старейшина пишет в суд и действует по закону (наблюдение за процессами).
-    deadline_check_interval_minutes: 15
+    deadline_check_interval_minutes: 5
+    # Интервал (минут) проверки каналов надзора: новые сообщения вносятся в отчёт, голоса судей пересчитываются, решения заносятся в БД.
+    channel_sync_interval_minutes: 5
     inbox_channel_key: elder_inbox      # куда граждане пишут заявки
     decisions_channel_key: elder_decisions  # куда бот публикует решения
     outbox_channel_key: elder_inbox     # куда отвечать по умолчанию (можно тред)
     notify_court_channel_key: court_inbox
     notify_council_channel_key: council_inbox
     referrals_channel_key: referrals
-    # Каналы надзора: при каждом сообщении старейшина проверяет легитимность действия (суд, совет, прокурор, КПП, рефералы)
-    watch_channel_keys: [court_inbox, council_inbox, prosecutor_inbox, kpp_inbox, referrals]
+    # Каналы надзора: решения суда, судебные прецеденты, поступающие запросы в суд, совет, прокурор, КПП, рефералы
+    watch_channel_keys: [court_inbox, court_decisions, law_judicial_precedents, council_inbox, prosecutor_inbox, kpp_inbox, referrals]
     # Зарезервировано: каналы, в которые старейшина может отправлять уведомления (в коде пока не используется)
     may_notify_channel_keys: [elder_inbox, elder_decisions, court_inbox, council_inbox, prosecutor_inbox, kpp_inbox, referrals]
+
+  # Совет: трое членов (council_1, council_2, council_3) — общие каналы, разные промпты
+  council_1:
+    inbox_channel_key: council_inbox
+    deliberations_channel_key: council_deliberations
+    court_decisions_channel_key: court_decisions
+    watch_channel_keys: [council_inbox, court_decisions]
+  council_2:
+    inbox_channel_key: council_inbox
+    deliberations_channel_key: council_deliberations
+    court_decisions_channel_key: court_decisions
+    watch_channel_keys: [council_inbox, court_decisions]
+  council_3:
+    inbox_channel_key: council_inbox
+    deliberations_channel_key: council_deliberations
+    court_decisions_channel_key: court_decisions
+    watch_channel_keys: [council_inbox, court_decisions]
