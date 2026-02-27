@@ -14,8 +14,9 @@ class ElderCase(Base):
     __tablename__ = "elder_cases"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_case_number = Column(Integer, nullable=True)  # порядковый номер в гильдии (1, 2, 3…) для отображения «дело №N»; id — для БД/API
     guild_id = Column(BigInteger, nullable=False, index=True)
-    case_type = Column(String(64), nullable=False)  # appeal_procedure, referendum_request, not_established_by_court
+    case_type = Column(String(64), nullable=False)  # referendum_request, civil_initiative, bill, appeal_procedure, not_established_by_court
     status = Column(String(64), nullable=False, default="open")  # open, closed
 
     author_id = Column(BigInteger, nullable=False, index=True)
@@ -101,7 +102,12 @@ class CouncilCase(Base):
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     result_at = Column(DateTime, nullable=True)  # когда подсчитаны голоса
+    result_announced_at = Column(DateTime, nullable=True)  # итог уже объявлён в канале (только один бот постит)
     execution_at = Column(DateTime, nullable=True)  # когда исполнено (если approved)
+    nudge_1vote_sent_at = Column(DateTime, nullable=True)
+    nudge_2votes_sent_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (UniqueConstraint("guild_id", "source_channel_id", "source_message_id", name="uq_council_case_source"),)
 
 
 class CouncilVote(Base):

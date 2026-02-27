@@ -50,6 +50,7 @@ async def async_init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         # Миграция: поля учёта срока суда и эскалации (если таблица elder_cases уже существовала)
         for col, typ in [
+            ("guild_case_number", "INTEGER"),
             ("sent_to_court_at", "DATETIME"),
             ("sent_to_court_content", "TEXT"),
             ("court_deadline_hours", "INTEGER"),
@@ -82,6 +83,24 @@ async def async_init_db() -> None:
                 await conn.execute(text(f"ALTER TABLE elder_court_log ADD COLUMN {col} {typ}"))
             except Exception:
                 pass
+        # Совет: напоминания и объявление итога
+        for col, typ in [
+            ("nudge_1vote_sent_at", "DATETIME"),
+            ("nudge_2votes_sent_at", "DATETIME"),
+            ("result_announced_at", "DATETIME"),
+        ]:
+            try:
+                await conn.execute(text(f"ALTER TABLE council_cases ADD COLUMN {col} {typ}"))
+            except Exception:
+                pass
+        # Уникальный индекс: одно дело на сообщение (предотвращает дубликаты при одновременной обработке ботами)
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_council_case_source "
+                "ON council_cases (guild_id, source_channel_id, source_message_id)"
+            ))
+        except Exception:
+            pass
 
 
 @asynccontextmanager

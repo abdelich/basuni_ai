@@ -100,6 +100,7 @@ class Config:
             "referrals": rcfg.get("referrals_channel_key") or "referrals",
             "deliberations": rcfg.get("deliberations_channel_key") or "council_deliberations",
             "court_decisions": rcfg.get("court_decisions_channel_key") or "court_decisions",
+            "execution_blog": rcfg.get("execution_blog_channel_key") or "council_execution_blog",
         }
         channel_key = key_map.get(purpose) or purpose
         channels = self.channels()

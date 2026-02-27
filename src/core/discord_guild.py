@@ -357,6 +357,16 @@ async def get_author_roles_block_async(
 _LAW_PRIORITY_LABELS = ("База (гос-образующие прецеденты)", "Судебные прецеденты")
 
 
+def _law_block_hint() -> str:
+    return (
+        "Закон и прецеденты (действуй только по закону). "
+        "Блок собран из двух каналов закона (конфиг: law_base_precedents, law_judicial_precedents) и остальных каналов категории «право». "
+        "На запрос про статью N (или часть M) ищи в тексте ниже именно эту статью/часть и отвечай только по этому тексту. "
+        "Если не нашёл — используй инструменты get_all_law_channel_contents() или get_channel_content(channel_id). "
+        "Не сообщай гражданину о сбоях загрузки каналов («не удалось получить доступ», «не удалось прочитать») — действуй по процедуре по имеющимся данным.\n\n"
+    )
+
+
 async def get_law_block_async(
     bot: Any,
     guild_id: int,
@@ -368,6 +378,7 @@ async def get_law_block_async(
     Текст закона/прецедентов для контекста агента. Все агенты должны всегда смотреть на закон и действовать только по нему.
     Если передан config с law_channel_ids() — сначала загружаются эти каналы (база, судебные прецеденты), затем остальные из категории «право».
     """
+    hint = _law_block_hint()
     parts: list[str] = []
     priority_ids: list[int] = []
     if config is not None and hasattr(config, "law_channel_ids") and callable(getattr(config, "law_channel_ids")):
@@ -376,8 +387,8 @@ async def get_law_block_async(
     for i, ch_id in enumerate(priority_ids):
         label = _LAW_PRIORITY_LABELS[i] if i < len(_LAW_PRIORITY_LABELS) else f"Канал {ch_id}"
         ch_content = await get_channel_content_async(bot, ch_id, limit=law_limit, as_law_document=True)
-        if ch_content.startswith("{") and "error" in ch_content:
-            parts.append(f"=== {label} (id: {ch_id}) ===\n[не удалось прочитать]")
+        if ch_content.startswith("{") and "error" in ch_content or ch_content.strip() == "В канале нет сообщений или нет доступа на чтение.":
+            parts.append(f"=== {label} (id: {ch_id}) ===\n[по каналу данных нет — действуй по процедуре по остальнему контексту]")
         else:
             ch_name = ""
             ch = bot.get_channel(ch_id) if hasattr(bot, "get_channel") else None
@@ -389,7 +400,8 @@ async def get_law_block_async(
     )
     if rest.startswith("{") and "error" in rest:
         if not parts:
-            return f"Закон и прецеденты: [не удалось загрузить: {rest}]"
+            content = "По каналам права данных нет. Действуй по процедуре: при заявке на законопроект/референдум и согласии гражданина сразу вызывай publish_decision, notify_court, record_case_sent_to_court. В ответе гражданину не упоминай недоступность каналов."
+            return hint + content
     else:
         if priority_ids:
             rest_ids = set(priority_ids)
@@ -403,8 +415,8 @@ async def get_law_block_async(
                     if ch.id in rest_ids:
                         continue
                     cnt = await get_channel_content_async(bot, ch.id, limit=law_limit, as_law_document=True)
-                    if cnt.startswith("{") and "error" in cnt:
-                        other_parts.append(f"=== {ch.name} (id: {ch.id}) ===\n[не удалось прочитать]")
+                    if cnt.startswith("{") and "error" in cnt or (cnt.strip() == "В канале нет сообщений или нет доступа на чтение."):
+                        other_parts.append(f"=== {ch.name} (id: {ch.id}) ===\n[по каналу данных нет — действуй по процедуре]")
                     else:
                         other_parts.append(f"=== {ch.name} (id: {ch.id}) ===\n{cnt}")
                 if other_parts:
@@ -414,10 +426,4 @@ async def get_law_block_async(
     content = "\n\n".join(parts)
     if len(content) > max_chars:
         content = content[:max_chars] + "\n[... обрезано ...]"
-    hint = (
-        "Закон и прецеденты (действуй только по закону). "
-        "Блок собран из двух каналов закона (конфиг: law_base_precedents, law_judicial_precedents) и остальных каналов категории «право». "
-        "На запрос про статью N (или часть M) ищи в тексте ниже именно эту статью/часть и отвечай только по этому тексту. "
-        "Если не нашёл — используй инструменты get_all_law_channel_contents() или get_channel_content(channel_id).\n\n"
-    )
     return hint + content

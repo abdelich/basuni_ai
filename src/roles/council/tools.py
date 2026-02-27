@@ -23,8 +23,12 @@ from src.core.discord_guild import (
 logger = logging.getLogger("basuni.council.tools")
 
 
-def make_council_tools(ctx: AgentContext, member_index: int) -> list[Tool]:
-    """Создаёт инструменты для члена совета (member_index 1, 2 или 3)."""
+def make_council_tools(ctx: AgentContext, member_index: int, *, execution_mode: bool = False) -> list[Tool]:
+    """Создаёт инструменты для члена совета (member_index 1, 2 или 3).
+
+    execution_mode=False (deliberation): только чтение + голосование.
+    execution_mode=True (исполнение): полный набор серверных инструментов.
+    """
 
     async def get_law(max_chars: int = 12000) -> str:
         """Получить текст закона из двух каналов права (база и судебные прецеденты). Ориентируйся только на этот текст."""
@@ -118,6 +122,7 @@ def make_council_tools(ctx: AgentContext, member_index: int) -> list[Tool]:
         text = f"**Член совета {member_index}:** {thoughts[:1500] if thoughts else '(без комментария)'}\n**Голос: {vote_label}**"
         try:
             await channel.send(text[:2000])
+            logger.info("Совет → [#%s]: %s", getattr(channel, "name", "?"), text[:150].replace("\n", " "))
         except Exception as e:
             logger.exception("post_my_deliberation send")
             return f"Голос записан в БД. Ошибка отправки в канал: {e!r}"
@@ -148,7 +153,9 @@ def make_council_tools(ctx: AgentContext, member_index: int) -> list[Tool]:
         if not channel:
             return f"Канал {channel_id} не найден."
         try:
-            await channel.send((content or "")[:2000])
+            text = (content or "")[:2000]
+            await channel.send(text)
+            logger.info("Совет → [#%s]: %s", getattr(channel, "name", "?"), text[:150].replace("\n", " "))
             return "Сообщение отправлено."
         except Exception as e:
             return f"Ошибка: {e!r}"
@@ -291,16 +298,27 @@ def make_council_tools(ctx: AgentContext, member_index: int) -> list[Tool]:
         except Exception as e:
             return f"Ошибка смены ника: {e!r}"
 
+    _created_roles: set[str] = set()
+
     async def create_role(name: str, color: int = 0, hoist: bool = False, mentionable: bool = False, permissions_value: int = 0) -> str:
         """Создать роль. color — десятичное число (0xRRGGBB), permissions_value — битовая маска прав (0 = без прав)."""
+        logger.info("create_role: вызов с name=%r, color=%r, hoist=%r, mentionable=%r, permissions_value=%r", name, color, hoist, mentionable, permissions_value)
+        norm_name = (name or "").strip().lower()
+        if norm_name in _created_roles:
+            logger.info("create_role: пропуск — роль «%s» уже создана в этом исполнении", name)
+            return f"Роль «{name}» уже создана в этом исполнении. Повторное создание пропущено."
         guild = ctx.bot.get_guild(ctx.guild_id)
         if not guild:
+            logger.error("create_role: гильдия %s не найдена", ctx.guild_id)
             return "Гильдия не найдена."
         try:
-            perms = discord.Permissions(permissions=permissions_value) if permissions_value else None
+            perms = discord.Permissions(permissions=int(permissions_value or 0))
             role = await guild.create_role(name=(name or "Новая роль")[:100], color=discord.Color(color) if color else discord.Color.default(), hoist=hoist, mentionable=mentionable, permissions=perms)
+            _created_roles.add(norm_name)
+            logger.info("create_role: УСПЕХ — роль «%s» (id=%s) создана на сервере", role.name, role.id)
             return f"Роль создана: {role.name} (id={role.id})."
         except Exception as e:
+            logger.error("create_role: ОШИБКА при создании роли «%s»: %s", name, e)
             return f"Ошибка создания роли: {e!r}"
 
     async def delete_role(role_id: int, reason: str = "") -> str:
@@ -606,6 +624,103 @@ def make_council_tools(ctx: AgentContext, member_index: int) -> list[Tool]:
             "bot": getattr(member, "bot", False),
         }, ensure_ascii=False, indent=0)
 
+    # ── Флаги одноразовых вызовов (в рамках одного запуска агента) ──
+    _once_flags: dict[str, bool] = {}
+
+    async def _find_last_article_number() -> int:
+        """Сканирует канал прецедентов (newest→oldest) и возвращает последний номер статьи (0 если нет)."""
+        import re as _re
+        ch_id = ctx.get_channel_id("law_judicial_precedents")
+        if not ch_id:
+            return 0
+        channel = ctx.bot.get_channel(ch_id)
+        if not channel:
+            return 0
+        _patterns = [
+            _re.compile(r"\*{0,2}(?:статья|ст\.?)\s*№?\s*(\d+)", _re.IGNORECASE),
+            _re.compile(r"(?:^|\n)\s*(?:#+\s*)?(\d+)\s*[\.\)]\s", _re.MULTILINE),
+        ]
+        found: list[int] = []
+        try:
+            async for msg in channel.history(limit=60, oldest_first=False):
+                text = (msg.content or "").strip()
+                if not text:
+                    continue
+                for pat in _patterns:
+                    for m in pat.finditer(text):
+                        found.append(int(m.group(1)))
+                if found:
+                    break
+        except Exception:
+            pass
+        return max(found) if found else 0
+
+    async def get_last_law_article_number() -> str:
+        """Получить номер последней статьи закона из канала судебных прецедентов. Следующую статью нумеруй как последняя + 1."""
+        last = await _find_last_article_number()
+        if last > 0:
+            return f"Последний номер статьи в канале прецедентов: {last}. Следующая статья должна быть №{last + 1}."
+        return "Статей с номерами не найдено. Начни с номера 1."
+
+    async def publish_new_law_article(title: str, text: str) -> str:
+        """Опубликовать новую статью закона в канал судебных прецедентов. Номер определяется автоматически (последний + 1). Вызывай ОДИН раз."""
+        if _once_flags.get("publish_new_law_article"):
+            return "Закон уже опубликован в этом исполнении."
+        ch_id = ctx.get_channel_id("law_judicial_precedents")
+        if not ch_id:
+            return "Канал судебных прецедентов не настроен."
+        channel = ctx.bot.get_channel(ch_id)
+        if not channel:
+            return "Канал судебных прецедентов не найден."
+        last = await _find_last_article_number()
+        article_number = last + 1
+        msg = f"**Статья №{article_number}. {title}**\n\n{text[:3800]}"
+        try:
+            await channel.send(msg[:4000])
+            _once_flags["publish_new_law_article"] = True
+            logger.info("Совет → [#%s]: Статья №%s «%s» (%d симв.)", getattr(channel, "name", "?"), article_number, title[:80], len(msg))
+            return f"Статья №{article_number} «{title}» опубликована в канал судебных прецедентов."
+        except Exception as e:
+            return f"Ошибка публикации: {e!r}"
+
+    async def post_council_outcome_to_deliberations(case_id: str, outcome_text: str) -> str:
+        """Опубликовать итог решения совета в канал обсуждений (deliberations). Один раз на дело."""
+        if _once_flags.get("post_council_outcome"):
+            return "Итог уже опубликован в этом исполнении."
+        ch_id = ctx.get_channel_id("deliberations")
+        if not ch_id:
+            return "Канал обсуждений совета не настроен."
+        channel = ctx.bot.get_channel(ch_id)
+        if not channel:
+            return "Канал обсуждений не найден."
+        try:
+            out_msg = f"**Итог по делу №{case_id}:**\n{outcome_text[:1800]}"[:2000]
+            await channel.send(out_msg)
+            _once_flags["post_council_outcome"] = True
+            logger.info("Совет → [#%s]: %s", getattr(channel, "name", "?"), out_msg[:150].replace("\n", " "))
+            return "Итог опубликован в канал обсуждений."
+        except Exception as e:
+            return f"Ошибка: {e!r}"
+
+    async def post_to_execution_blog(case_id: str, summary: str) -> str:
+        """Записать краткий отчёт об исполнении в блог совета (execution_blog). Один раз на дело."""
+        if _once_flags.get("post_to_execution_blog"):
+            return "Отчёт уже записан в блог."
+        ch_id = ctx.get_channel_id("execution_blog")
+        if not ch_id:
+            return "Канал блога исполнения не настроен."
+        channel = ctx.bot.get_channel(ch_id)
+        if not channel:
+            return "Канал блога не найден."
+        try:
+            blog_msg = f"**Исполнение дела №{case_id}:**\n{summary[:1800]}"[:2000]
+            await channel.send(blog_msg)
+            _once_flags["post_to_execution_blog"] = True
+            logger.info("Совет → [#%s]: %s", getattr(channel, "name", "?"), blog_msg[:150].replace("\n", " "))
+            return "Отчёт записан в блог исполнения."
+        except Exception as e:
+            return f"Ошибка: {e!r}"
+
     # Build tools list
     tools: list[Tool] = []
 
@@ -641,7 +756,7 @@ def make_council_tools(ctx: AgentContext, member_index: int) -> list[Tool]:
             "thoughts": ("string", "Твои мысли/обоснование"),
             "vote": ("string", "yes или no"),
         }),
-        execute=lambda case_id, thoughts, vote: post_my_deliberation(case_id, thoughts or "", vote or "no"),
+        execute=lambda case_id, thoughts="", vote="no": post_my_deliberation(case_id, thoughts or "", vote or "no"),
     ))
     tools.append(Tool(
         name="list_council_cases",
@@ -655,225 +770,285 @@ def make_council_tools(ctx: AgentContext, member_index: int) -> list[Tool]:
         parameters={},
         execute=get_roles_and_members,
     ))
-    tools.append(Tool(
-        name="send_message_to_channel",
-        description="Отправить сообщение в канал по ID.",
-        parameters=build_parameters({"channel_id": ("integer", "ID канала"), "content": ("string", "Текст")}),
-        execute=lambda channel_id, content: send_message_to_channel(channel_id, content or ""),
-    ))
-    tools.append(Tool(
-        name="add_role_to_member",
-        description="Выдать участнику роль (member_id, role_id из get_roles_and_members).",
-        parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "role_id": ("integer", "Discord ID роли")}),
-        execute=lambda member_id, role_id: add_role_to_member(member_id, role_id),
-    ))
-    tools.append(Tool(
-        name="remove_role_from_member",
-        description="Снять роль у участника.",
-        parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "role_id": ("integer", "Discord ID роли")}),
-        execute=lambda member_id, role_id: remove_role_from_member(member_id, role_id),
-    ))
-    tools.append(Tool(
-        name="timeout_member",
-        description="Таймаут (mute) участника на N минут.",
-        parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "duration_minutes": ("integer", "Минут")}),
-        execute=lambda member_id, duration_minutes: timeout_member(member_id, duration_minutes or 60),
-    ))
-    tools.append(Tool(
-        name="kick_member",
-        description="Исключить участника с сервера (kick).",
-        parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "reason": ("string", "Причина")}, required=["member_id"]),
-        execute=lambda member_id, reason="": kick_member(member_id, reason or ""),
-    ))
-    tools.append(Tool(
-        name="ban_member",
-        description="Забанить участника. delete_message_days — удалить его сообщения за последние 0–7 дней.",
-        parameters=build_parameters({
-            "member_id": ("integer", "Discord ID участника"),
-            "reason": ("string", "Причина"),
-            "delete_message_days": ("integer", "Удалить сообщения за последние N дней (0–7)"),
-        }, required=["member_id"]),
-        execute=lambda member_id, reason="", delete_message_days=0: ban_member(member_id, reason or "", delete_message_days or 0),
-    ))
-    tools.append(Tool(
-        name="unban_member",
-        description="Разбанить пользователя по Discord ID.",
-        parameters=build_parameters({"user_id": ("integer", "Discord ID пользователя"), "reason": ("string", "Причина")}, required=["user_id"]),
-        execute=lambda user_id, reason="": unban_member(user_id, reason or ""),
-    ))
-    tools.append(Tool(
-        name="remove_timeout",
-        description="Снять таймаут (mute) с участника.",
-        parameters=build_parameters({"member_id": ("integer", "Discord ID участника")}),
-        execute=remove_timeout,
-    ))
-    tools.append(Tool(
-        name="set_member_nick",
-        description="Изменить никнейм участника на сервере. Пустая строка — сбросить на дефолтный.",
-        parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "nick": ("string", "Новый ник (до 32 символов)")}),
-        execute=lambda member_id, nick: set_member_nick(member_id, nick or ""),
-    ))
-    tools.append(Tool(
-        name="create_role",
-        description="Создать роль. color — число (например 0xRRGGBB в десятичном виде), permissions_value — битовая маска прав (0 = без прав).",
-        parameters=build_parameters({
-            "name": ("string", "Название роли"),
-            "color": ("integer", "Цвет (десятичное число, 0 = дефолт)"),
-            "hoist": ("boolean", "Показывать отдельно в списке участников"),
-            "mentionable": ("boolean", "Разрешить упоминание роли"),
-            "permissions_value": ("integer", "Битовая маска прав (0 = без прав)"),
-        }, required=["name"]),
-        execute=lambda name, color=0, hoist=False, mentionable=False, permissions_value=0: create_role(name or "", color or 0, hoist, mentionable, permissions_value or 0),
-    ))
-    tools.append(Tool(
-        name="delete_role",
-        description="Удалить роль по ID.",
-        parameters=build_parameters({"role_id": ("integer", "Discord ID роли"), "reason": ("string", "Причина")}, required=["role_id"]),
-        execute=lambda role_id, reason="": delete_role(role_id, reason or ""),
-    ))
-    tools.append(Tool(
-        name="edit_role",
-        description="Изменить роль: name, color (0xRRGGBB в десятичном, -1 не менять), hoist, mentionable.",
-        parameters=build_parameters({
-            "role_id": ("integer", "Discord ID роли"),
-            "name": ("string", "Новое название"),
-            "color": ("integer", "Цвет (-1 не менять)"),
-            "hoist": ("boolean", "Показывать отдельно"),
-            "mentionable": ("boolean", "Упоминаемая"),
-        }, required=["role_id"]),
-        execute=lambda role_id, name="", color=-1, hoist=False, mentionable=False: edit_role(role_id, name or "", color, hoist, mentionable),
-    ))
-    tools.append(Tool(
-        name="create_text_channel",
-        description="Создать текстовый канал. category_id — ID категории (0 — без категории), slowmode_seconds — задержка между сообщениями (0–21600).",
-        parameters=build_parameters({
-            "name": ("string", "Название канала"),
-            "category_id": ("integer", "ID категории (0 — без категории)"),
-            "topic": ("string", "Тема канала"),
-            "slowmode_seconds": ("integer", "Задержка между сообщениями (0–21600)"),
-            "nsfw": ("boolean", "NSFW канал"),
-        }, required=["name"]),
-        execute=lambda name, category_id=0, topic="", slowmode_seconds=0, nsfw=False: create_text_channel(name or "", category_id or 0, topic or "", slowmode_seconds or 0, nsfw),
-    ))
-    tools.append(Tool(
-        name="create_voice_channel",
-        description="Создать голосовой канал. user_limit — макс. участников (0 = без лимита), bitrate — битрейт в битах/с.",
-        parameters=build_parameters({
-            "name": ("string", "Название канала"),
-            "category_id": ("integer", "ID категории (0 — без)"),
-            "user_limit": ("integer", "Макс. участников (0 = без лимита)"),
-            "bitrate": ("integer", "Битрейт в битах/с (8000–384000)"),
-        }, required=["name"]),
-        execute=lambda name, category_id=0, user_limit=0, bitrate=64000: create_voice_channel(name or "", category_id or 0, user_limit or 0, bitrate or 64000),
-    ))
-    tools.append(Tool(
-        name="create_category",
-        description="Создать категорию каналов.",
-        parameters=build_parameters({"name": ("string", "Название категории"), "position": ("integer", "Позиция в списке")}, required=["name"]),
-        execute=lambda name, position=0: create_category(name or "", position or 0),
-    ))
-    tools.append(Tool(
-        name="delete_channel",
-        description="Удалить канал или категорию по ID.",
-        parameters=build_parameters({"channel_id": ("integer", "ID канала/категории"), "reason": ("string", "Причина")}, required=["channel_id"]),
-        execute=lambda channel_id, reason="": delete_channel(channel_id, reason or ""),
-    ))
-    tools.append(Tool(
-        name="edit_channel",
-        description="Изменить канал: name, topic, slowmode_seconds (-1 не менять), nsfw, category_id (0 не менять).",
-        parameters=build_parameters({
-            "channel_id": ("integer", "ID канала"),
-            "name": ("string", "Новое название"),
-            "topic": ("string", "Тема"),
-            "slowmode_seconds": ("integer", "Задержка сообщений (-1 не менять)"),
-            "nsfw": ("boolean", "NSFW"),
-            "category_id": ("integer", "ID категории (0 не менять)"),
-        }, required=["channel_id"]),
-        execute=lambda channel_id, name="", topic="", slowmode_seconds=-1, nsfw=False, category_id=0: edit_channel(channel_id, name or "", topic or "", slowmode_seconds, nsfw, category_id or 0),
-    ))
-    tools.append(Tool(
-        name="set_channel_permission",
-        description="Настроить права доступа канала для роли или участника. target_type: role или member. allow_view/deny_view, allow_send/deny_send — просмотр канала и отправка сообщений.",
-        parameters=build_parameters({
-            "channel_id": ("integer", "ID канала"),
-            "target_id": ("integer", "ID роли или участника"),
-            "target_type": ("string", "role или member"),
-            "allow_view": ("boolean", "Разрешить просмотр"),
-            "deny_view": ("boolean", "Запретить просмотр"),
-            "allow_send": ("boolean", "Разрешить отправку сообщений"),
-            "deny_send": ("boolean", "Запретить отправку"),
-        }, required=["channel_id", "target_id"]),
-        execute=lambda channel_id, target_id, target_type="role", allow_view=True, deny_view=False, allow_send=True, deny_send=False: set_channel_permission(channel_id, target_id, allow_view, deny_view, allow_send, deny_send, target_type),
-    ))
-    tools.append(Tool(
-        name="move_member_voice",
-        description="Переместить участника в другой голосовой канал. voice_channel_id=0 — отключить из канала.",
-        parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "voice_channel_id": ("integer", "ID голосового канала (0 — отключить)")}),
-        execute=lambda member_id, voice_channel_id: move_member_voice(member_id, voice_channel_id),
-    ))
-    tools.append(Tool(
-        name="delete_message",
-        description="Удалить сообщение по ID канала и ID сообщения.",
-        parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения")}),
-        execute=lambda channel_id, message_id: delete_message(channel_id, message_id),
-    ))
-    tools.append(Tool(
-        name="edit_message",
-        description="Изменить текст сообщения (от имени бота).",
-        parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения"), "new_content": ("string", "Новый текст")}),
-        execute=lambda channel_id, message_id, new_content: edit_message(channel_id, message_id, new_content or ""),
-    ))
-    tools.append(Tool(
-        name="pin_message",
-        description="Закрепить сообщение в канале.",
-        parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения")}),
-        execute=lambda channel_id, message_id: pin_message(channel_id, message_id),
-    ))
-    tools.append(Tool(
-        name="unpin_message",
-        description="Открепить сообщение.",
-        parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения")}),
-        execute=lambda channel_id, message_id: unpin_message(channel_id, message_id),
-    ))
-    tools.append(Tool(
-        name="add_reaction",
-        description="Поставить реакцию на сообщение. emoji — Unicode (👍) или имя кастомного эмодзи сервера.",
-        parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения"), "emoji": ("string", "Эмодзи (Unicode или имя)")}),
-        execute=lambda channel_id, message_id, emoji: add_reaction(channel_id, message_id, emoji or "✅"),
-    ))
-    tools.append(Tool(
-        name="create_thread",
-        description="Создать тред в канале. message_id — от какого сообщения (0 — без привязки), auto_archive_minutes: 60, 1440, 43200, 10080.",
-        parameters=build_parameters({
-            "channel_id": ("integer", "ID канала"),
-            "name": ("string", "Название треда"),
-            "message_id": ("integer", "ID сообщения (0 — без привязки)"),
-            "auto_archive_minutes": ("integer", "Через сколько минут архивировать (60–10080)"),
-        }, required=["channel_id", "name"]),
-        execute=lambda channel_id, name, message_id=0, auto_archive_minutes=60: create_thread(channel_id, name or "", message_id or 0, auto_archive_minutes or 60),
-    ))
-    tools.append(Tool(
-        name="create_invite",
-        description="Создать приглашение в канал. max_age_seconds — время жизни (0 = бессрочно), max_uses — макс. использований (0 = без лимита).",
-        parameters=build_parameters({
-            "channel_id": ("integer", "ID канала"),
-            "max_age_seconds": ("integer", "Время жизни в секундах (0 = бессрочно)"),
-            "max_uses": ("integer", "Макс. использований (0 = без лимита)"),
-            "temporary": ("boolean", "Временное членство (при выходе теряет роли)"),
-        }, required=["channel_id"]),
-        execute=lambda channel_id, max_age_seconds=0, max_uses=0, temporary=False: create_invite(channel_id, max_age_seconds or 0, max_uses or 0, temporary),
-    ))
+    # ── Guard: если задан целевой участник, блокировать операции над другими ──
+    _target_mid = ctx.extra.get("target_member_id") if ctx.extra else None
+    _target_mname = ctx.extra.get("target_member_name", "") if ctx.extra else ""
+
+    async def _guarded_add_role(member_id: int, role_id: int) -> str:
+        mid = int(member_id)
+        if _target_mid and mid != int(_target_mid):
+            return (
+                f"ЗАБЛОКИРОВАНО: целевой участник = {_target_mname} (member_id={_target_mid}). "
+                f"Ты указал member_id={member_id} — НЕВЕРНО. Используй member_id={_target_mid}."
+            )
+        return await add_role_to_member(mid, role_id)
+
+    async def _guarded_remove_role(member_id: int, role_id: int) -> str:
+        mid = int(member_id)
+        if _target_mid and mid != int(_target_mid):
+            return (
+                f"ЗАБЛОКИРОВАНО: целевой участник = {_target_mname} (member_id={_target_mid}). "
+                f"Ты указал member_id={member_id} — НЕВЕРНО. Используй member_id={_target_mid}."
+            )
+        return await remove_role_from_member(mid, role_id)
+
+    # ── Инструменты, доступные только при исполнении (execution_mode=True) ──
+    if execution_mode:
+        tools.append(Tool(
+            name="send_message_to_channel",
+            description="Отправить сообщение в канал по ID.",
+            parameters=build_parameters({"channel_id": ("integer", "ID канала"), "content": ("string", "Текст")}),
+            execute=lambda channel_id, content="": send_message_to_channel(channel_id, content or ""),
+        ))
+        tools.append(Tool(
+            name="add_role_to_member",
+            description="Выдать участнику роль (member_id, role_id из get_roles_and_members).",
+            parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "role_id": ("integer", "Discord ID роли")}),
+            execute=lambda member_id, role_id: _guarded_add_role(member_id, role_id),
+        ))
+        tools.append(Tool(
+            name="remove_role_from_member",
+            description="Снять роль у участника.",
+            parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "role_id": ("integer", "Discord ID роли")}),
+            execute=lambda member_id, role_id: _guarded_remove_role(member_id, role_id),
+        ))
+        tools.append(Tool(
+            name="timeout_member",
+            description="Таймаут (mute) участника на N минут. ОПАСНО: вызывай ТОЛЬКО если в тексте решения ЯВНО указан конкретный участник и действие «таймаут/мут». Никогда не мьюти по догадке.",
+            parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "duration_minutes": ("integer", "Минут")}),
+            execute=lambda member_id, duration_minutes: timeout_member(member_id, duration_minutes or 60),
+        ))
+        tools.append(Tool(
+            name="kick_member",
+            description="Исключить участника с сервера (kick). ОПАСНО: вызывай ТОЛЬКО если в тексте решения ЯВНО указан конкретный участник и действие «исключить/кикнуть». Никогда не кикай по догадке.",
+            parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "reason": ("string", "Причина")}, required=["member_id"]),
+            execute=lambda member_id, reason="": kick_member(member_id, reason or ""),
+        ))
+        tools.append(Tool(
+            name="ban_member",
+            description="Забанить участника. ОПАСНО: вызывай ТОЛЬКО если в тексте решения ЯВНО указан конкретный участник и действие «забанить». Никогда не баннь по догадке или без прямого указания.",
+            parameters=build_parameters({
+                "member_id": ("integer", "Discord ID участника"),
+                "reason": ("string", "Причина"),
+                "delete_message_days": ("integer", "Удалить сообщения за последние N дней (0–7)"),
+            }, required=["member_id"]),
+            execute=lambda member_id, reason="", delete_message_days=0: ban_member(member_id, reason or "", delete_message_days or 0),
+        ))
+        tools.append(Tool(
+            name="unban_member",
+            description="Разбанить пользователя по Discord ID.",
+            parameters=build_parameters({"user_id": ("integer", "Discord ID пользователя"), "reason": ("string", "Причина")}, required=["user_id"]),
+            execute=lambda user_id, reason="": unban_member(user_id, reason or ""),
+        ))
+        tools.append(Tool(
+            name="remove_timeout",
+            description="Снять таймаут (mute) с участника.",
+            parameters=build_parameters({"member_id": ("integer", "Discord ID участника")}),
+            execute=remove_timeout,
+        ))
+        tools.append(Tool(
+            name="set_member_nick",
+            description="Изменить никнейм участника на сервере. Пустая строка — сбросить на дефолтный.",
+            parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "nick": ("string", "Новый ник (до 32 символов)")}),
+            execute=lambda member_id, nick="": set_member_nick(member_id, nick or ""),
+        ))
+        tools.append(Tool(
+            name="create_role",
+            description="Создать роль. color — число (например 0xRRGGBB в десятичном виде), permissions_value — битовая маска прав (0 = без прав).",
+            parameters=build_parameters({
+                "name": ("string", "Название роли"),
+                "color": ("integer", "Цвет (десятичное число, 0 = дефолт)"),
+                "hoist": ("boolean", "Показывать отдельно в списке участников"),
+                "mentionable": ("boolean", "Разрешить упоминание роли"),
+                "permissions_value": ("integer", "Битовая маска прав (0 = без прав)"),
+            }, required=["name"]),
+            execute=lambda name, color=0, hoist=False, mentionable=False, permissions_value=0: create_role(name or "", color or 0, hoist, mentionable, permissions_value or 0),
+        ))
+        tools.append(Tool(
+            name="delete_role",
+            description="Удалить роль по ID.",
+            parameters=build_parameters({"role_id": ("integer", "Discord ID роли"), "reason": ("string", "Причина")}, required=["role_id"]),
+            execute=lambda role_id, reason="": delete_role(role_id, reason or ""),
+        ))
+        tools.append(Tool(
+            name="edit_role",
+            description="Изменить роль: name, color (0xRRGGBB в десятичном, -1 не менять), hoist, mentionable.",
+            parameters=build_parameters({
+                "role_id": ("integer", "Discord ID роли"),
+                "name": ("string", "Новое название"),
+                "color": ("integer", "Цвет (-1 не менять)"),
+                "hoist": ("boolean", "Показывать отдельно"),
+                "mentionable": ("boolean", "Упоминаемая"),
+            }, required=["role_id"]),
+            execute=lambda role_id, name="", color=-1, hoist=False, mentionable=False: edit_role(role_id, name or "", color, hoist, mentionable),
+        ))
+        tools.append(Tool(
+            name="create_text_channel",
+            description="Создать текстовый канал. category_id — ID категории (0 — без категории), slowmode_seconds — задержка между сообщениями (0–21600).",
+            parameters=build_parameters({
+                "name": ("string", "Название канала"),
+                "category_id": ("integer", "ID категории (0 — без категории)"),
+                "topic": ("string", "Тема канала"),
+                "slowmode_seconds": ("integer", "Задержка между сообщениями (0–21600)"),
+                "nsfw": ("boolean", "NSFW канал"),
+            }, required=["name"]),
+            execute=lambda name, category_id=0, topic="", slowmode_seconds=0, nsfw=False: create_text_channel(name or "", category_id or 0, topic or "", slowmode_seconds or 0, nsfw),
+        ))
+        tools.append(Tool(
+            name="create_voice_channel",
+            description="Создать голосовой канал. user_limit — макс. участников (0 = без лимита), bitrate — битрейт в битах/с.",
+            parameters=build_parameters({
+                "name": ("string", "Название канала"),
+                "category_id": ("integer", "ID категории (0 — без)"),
+                "user_limit": ("integer", "Макс. участников (0 = без лимита)"),
+                "bitrate": ("integer", "Битрейт в битах/с (8000–384000)"),
+            }, required=["name"]),
+            execute=lambda name, category_id=0, user_limit=0, bitrate=64000: create_voice_channel(name or "", category_id or 0, user_limit or 0, bitrate or 64000),
+        ))
+        tools.append(Tool(
+            name="create_category",
+            description="Создать категорию каналов.",
+            parameters=build_parameters({"name": ("string", "Название категории"), "position": ("integer", "Позиция в списке")}, required=["name"]),
+            execute=lambda name, position=0: create_category(name or "", position or 0),
+        ))
+        tools.append(Tool(
+            name="delete_channel",
+            description="Удалить канал или категорию по ID. ОПАСНО: вызывай ТОЛЬКО если в решении ЯВНО сказано удалить конкретный канал.",
+            parameters=build_parameters({"channel_id": ("integer", "ID канала/категории"), "reason": ("string", "Причина")}, required=["channel_id"]),
+            execute=lambda channel_id, reason="": delete_channel(channel_id, reason or ""),
+        ))
+        tools.append(Tool(
+            name="edit_channel",
+            description="Изменить канал: name, topic, slowmode_seconds (-1 не менять), nsfw, category_id (0 не менять).",
+            parameters=build_parameters({
+                "channel_id": ("integer", "ID канала"),
+                "name": ("string", "Новое название"),
+                "topic": ("string", "Тема"),
+                "slowmode_seconds": ("integer", "Задержка сообщений (-1 не менять)"),
+                "nsfw": ("boolean", "NSFW"),
+                "category_id": ("integer", "ID категории (0 не менять)"),
+            }, required=["channel_id"]),
+            execute=lambda channel_id, name="", topic="", slowmode_seconds=-1, nsfw=False, category_id=0: edit_channel(channel_id, name or "", topic or "", slowmode_seconds, nsfw, category_id or 0),
+        ))
+        tools.append(Tool(
+            name="set_channel_permission",
+            description="Настроить права доступа канала для роли или участника. target_type: role или member. allow_view/deny_view, allow_send/deny_send — просмотр канала и отправка сообщений.",
+            parameters=build_parameters({
+                "channel_id": ("integer", "ID канала"),
+                "target_id": ("integer", "ID роли или участника"),
+                "target_type": ("string", "role или member"),
+                "allow_view": ("boolean", "Разрешить просмотр"),
+                "deny_view": ("boolean", "Запретить просмотр"),
+                "allow_send": ("boolean", "Разрешить отправку сообщений"),
+                "deny_send": ("boolean", "Запретить отправку"),
+            }, required=["channel_id", "target_id"]),
+            execute=lambda channel_id, target_id, target_type="role", allow_view=True, deny_view=False, allow_send=True, deny_send=False: set_channel_permission(channel_id, target_id, allow_view, deny_view, allow_send, deny_send, target_type),
+        ))
+        tools.append(Tool(
+            name="move_member_voice",
+            description="Переместить участника в другой голосовой канал. voice_channel_id=0 — отключить из канала.",
+            parameters=build_parameters({"member_id": ("integer", "Discord ID участника"), "voice_channel_id": ("integer", "ID голосового канала (0 — отключить)")}),
+            execute=lambda member_id, voice_channel_id: move_member_voice(member_id, voice_channel_id),
+        ))
+        tools.append(Tool(
+            name="delete_message",
+            description="Удалить сообщение по ID канала и ID сообщения.",
+            parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения")}),
+            execute=lambda channel_id, message_id: delete_message(channel_id, message_id),
+        ))
+        tools.append(Tool(
+            name="edit_message",
+            description="Изменить текст сообщения (от имени бота).",
+            parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения"), "new_content": ("string", "Новый текст")}),
+            execute=lambda channel_id, message_id, new_content="": edit_message(channel_id, message_id, new_content or ""),
+        ))
+        tools.append(Tool(
+            name="pin_message",
+            description="Закрепить сообщение в канале.",
+            parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения")}),
+            execute=lambda channel_id, message_id: pin_message(channel_id, message_id),
+        ))
+        tools.append(Tool(
+            name="unpin_message",
+            description="Открепить сообщение.",
+            parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения")}),
+            execute=lambda channel_id, message_id: unpin_message(channel_id, message_id),
+        ))
+        tools.append(Tool(
+            name="add_reaction",
+            description="Поставить реакцию на сообщение. emoji — Unicode (👍) или имя кастомного эмодзи сервера.",
+            parameters=build_parameters({"channel_id": ("integer", "ID канала"), "message_id": ("integer", "ID сообщения"), "emoji": ("string", "Эмодзи (Unicode или имя)")}),
+            execute=lambda channel_id, message_id, emoji="✅": add_reaction(channel_id, message_id, emoji or "✅"),
+        ))
+        tools.append(Tool(
+            name="create_thread",
+            description="Создать тред в канале. message_id — от какого сообщения (0 — без привязки), auto_archive_minutes: 60, 1440, 43200, 10080.",
+            parameters=build_parameters({
+                "channel_id": ("integer", "ID канала"),
+                "name": ("string", "Название треда"),
+                "message_id": ("integer", "ID сообщения (0 — без привязки)"),
+                "auto_archive_minutes": ("integer", "Через сколько минут архивировать (60–10080)"),
+            }, required=["channel_id", "name"]),
+            execute=lambda channel_id, name, message_id=0, auto_archive_minutes=60: create_thread(channel_id, name or "", message_id or 0, auto_archive_minutes or 60),
+        ))
+        tools.append(Tool(
+            name="create_invite",
+            description="Создать приглашение в канал. max_age_seconds — время жизни (0 = бессрочно), max_uses — макс. использований (0 = без лимита).",
+            parameters=build_parameters({
+                "channel_id": ("integer", "ID канала"),
+                "max_age_seconds": ("integer", "Время жизни в секундах (0 = бессрочно)"),
+                "max_uses": ("integer", "Макс. использований (0 = без лимита)"),
+                "temporary": ("boolean", "Временное членство (при выходе теряет роли)"),
+            }, required=["channel_id"]),
+            execute=lambda channel_id, max_age_seconds=0, max_uses=0, temporary=False: create_invite(channel_id, max_age_seconds or 0, max_uses or 0, temporary),
+        ))
+        tools.append(Tool(
+            name="purge_channel_messages",
+            description="Удалить последние сообщения в канале (до 100 за раз). ОПАСНО: вызывай ТОЛЬКО если в решении ЯВНО сказано очистить канал.",
+            parameters=build_parameters({"channel_id": ("integer", "ID канала"), "limit": ("integer", "Сколько удалить (1–100)")}, required=["channel_id"]),
+            execute=lambda channel_id, limit=100: purge_channel_messages(channel_id, limit or 100),
+        ))
+        # ── Законотворчество и отчётность ──
+        tools.append(Tool(
+            name="get_last_law_article_number",
+            description="Узнать номер последней статьи закона в канале прецедентов (чтобы определить следующий номер).",
+            parameters={},
+            execute=get_last_law_article_number,
+        ))
+        tools.append(Tool(
+            name="publish_new_law_article",
+            description="Опубликовать новую статью закона в канал судебных прецедентов. Номер определяется автоматически (последний в канале + 1). Вызывай ОДИН раз.",
+            parameters=build_parameters({
+                "title": ("string", "Название статьи"),
+                "text": ("string", "Полный текст статьи"),
+            }),
+            execute=lambda title="", text="": publish_new_law_article(title or "", text or ""),
+        ))
+        tools.append(Tool(
+            name="post_council_outcome_to_deliberations",
+            description="Опубликовать итог решения совета в канал обсуждений. Вызывай ОДИН раз после исполнения.",
+            parameters=build_parameters({
+                "case_id": ("string", "Номер дела"),
+                "outcome_text": ("string", "Текст итога"),
+            }),
+            execute=lambda case_id, outcome_text="": post_council_outcome_to_deliberations(case_id, outcome_text or ""),
+        ))
+        tools.append(Tool(
+            name="post_to_execution_blog",
+            description="Записать краткий отчёт об исполнении в блог совета. Вызывай ОДИН раз после исполнения.",
+            parameters=build_parameters({
+                "case_id": ("string", "Номер дела"),
+                "summary": ("string", "Краткий отчёт"),
+            }),
+            execute=lambda case_id, summary="": post_to_execution_blog(case_id, summary or ""),
+        ))
+
+    # ── Read-only инструменты (всегда доступны) ──
     tools.append(Tool(
         name="get_channels_list",
         description="Список всех каналов и категорий сервера: id, name, type, category. Для выбора channel_id в других инструментах.",
         parameters={},
         execute=get_channels_list,
-    ))
-    tools.append(Tool(
-        name="purge_channel_messages",
-        description="Удалить последние сообщения в канале (до 100 за раз).",
-        parameters=build_parameters({"channel_id": ("integer", "ID канала"), "limit": ("integer", "Сколько удалить (1–100)")}, required=["channel_id"]),
-        execute=lambda channel_id, limit=100: purge_channel_messages(channel_id, limit or 100),
     ))
     tools.append(Tool(
         name="get_member_info",

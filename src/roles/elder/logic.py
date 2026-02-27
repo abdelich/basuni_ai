@@ -9,9 +9,11 @@ from typing import Any
 
 
 class ElderCaseType(str, Enum):
-    """Типы дел, которые вправе рассматривать старейшины."""
+    """Типы дел (реальные процедуры): референдум, гражданская инициатива, законопроект, апелляция."""
     APPEAL_PROCEDURE = "appeal_procedure"
     REFERENDUM_REQUEST = "referendum_request"
+    CIVIL_INITIATIVE = "civil_initiative"
+    BILL = "bill"
     NOT_ESTABLISHED_BY_COURT = "not_established_by_court"
 
 
@@ -36,8 +38,12 @@ def elder_may_decide(decision: str) -> bool:
 
 
 def elder_may_decide_for_case(decision: str, case_type: str) -> bool:
-    """Проверка: решение допустимо для данного типа дела. По референдуму — только одобрить или отклонить; по апелляции — только confirm/send_to_council/return_to_court."""
-    if case_type == ElderCaseType.REFERENDUM_REQUEST.value:
+    """Проверка: решение допустимо для данного типа дела. По референдуму/законопроекту/гражданской инициативе — одобрить или отклонить (первое обращение); по апелляции — только confirm/send_to_council/return_to_court."""
+    if case_type in (
+        ElderCaseType.REFERENDUM_REQUEST.value,
+        ElderCaseType.CIVIL_INITIATIVE.value,
+        ElderCaseType.BILL.value,
+    ):
         return decision in (ElderDecision.REFERENDUM_APPROVED.value, ElderDecision.REFERENDUM_REJECTED.value)
     # По апелляции и «не установлено судом» — только классические решения, не референдумные
     if decision in (ElderDecision.REFERENDUM_APPROVED.value, ElderDecision.REFERENDUM_REJECTED.value):

@@ -16,6 +16,8 @@ channels:
   council_inbox: 1474356901650366496
   # Канал, куда трое членов совета пишут мысли и голоса (только «За» или «Против», без воздержаний).
   council_deliberations: 1475987043849994250
+  # Блог исполнения: сюда совет пишет о созданных законах и исполненных решениях (один пост по итогу дела).
+  council_execution_blog: 1474443223379218606
   prosecutor_inbox: 1474357751873405064
   kpp_inbox: 1474368849758650452
   referrals: 1475128588167680062
@@ -48,6 +50,7 @@ openai_model: gpt-4o-mini
 # openai_base_url: https://openrouter.ai/api/v1
 # openai_model: meta-llama/llama-3.1-70b-instruct
 
+# Роль совета (council) в Discord должна иметь право «Администратор» (permission integer 8), чтобы боты могли создавать роли, каналы и выполнять решения.
 # Какие боты запускать (ключи: elder, council_1, council_2, council_3, prosecutor, kpp, judge)
 enabled_roles:
   - elder
@@ -66,11 +69,11 @@ roles:
     # Когда старейшина решил не отвечать (обращение не к нему) — отправить одну из этих фраз. Если не задано — встроенный список.
     skip_reply_phrases: ["Поконкретнее будь", "Это не ко мне.", "Пошел нахуй с таким", "Теряйся в страхе", "Я сейчас занят", "Не смогу помочь", "Я не знаю, что делать", "Я пока какаю, не могу дать ответ, посерьезнее подвигайся чуть."]
     # Срок, за который суд должен принять решение (оба судьи). Часы, можно дробное: 0.25 = 15 мин, 1 = 1 ч, 24 = 1 сут. По истечении старейшина решает по закону.
-    court_deadline_hours: 0.25
+    court_deadline_hours: 0.02
     # Интервал (минут) проверки дел с истёкшим сроком суда: старейшина пишет в суд и действует по закону (наблюдение за процессами).
-    deadline_check_interval_minutes: 5
+    deadline_check_interval_minutes: 1
     # Интервал (минут) проверки каналов надзора: новые сообщения вносятся в отчёт, голоса судей пересчитываются, решения заносятся в БД.
-    channel_sync_interval_minutes: 5
+    channel_sync_interval_minutes: 1
     inbox_channel_key: elder_inbox      # куда граждане пишут заявки
     decisions_channel_key: elder_decisions  # куда бот публикует решения
     outbox_channel_key: elder_inbox     # куда отвечать по умолчанию (можно тред)
@@ -87,14 +90,18 @@ roles:
     inbox_channel_key: council_inbox
     deliberations_channel_key: council_deliberations
     court_decisions_channel_key: court_decisions
-    watch_channel_keys: [council_inbox, court_decisions]
+    execution_blog_channel_key: council_execution_blog
+    # deliberations — чтобы получать напоминания «не хватает голоса» (напоминания постим туда, не в inbox, чтобы не создавать второе дело)
+    watch_channel_keys: [council_inbox, court_decisions, council_deliberations]
   council_2:
     inbox_channel_key: council_inbox
     deliberations_channel_key: council_deliberations
     court_decisions_channel_key: court_decisions
-    watch_channel_keys: [council_inbox, court_decisions]
+    execution_blog_channel_key: council_execution_blog
+    watch_channel_keys: [council_inbox, court_decisions, council_deliberations]
   council_3:
     inbox_channel_key: council_inbox
     deliberations_channel_key: council_deliberations
     court_decisions_channel_key: court_decisions
-    watch_channel_keys: [council_inbox, court_decisions]
+    execution_blog_channel_key: council_execution_blog
+    watch_channel_keys: [council_inbox, court_decisions, council_deliberations]

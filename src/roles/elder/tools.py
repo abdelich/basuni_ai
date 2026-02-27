@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete, or_, select, update  # type: ignore[reportMissingImports]
+from sqlalchemy import and_, delete, or_, select, update  # type: ignore[reportMissingImports]
 
 from src.core.tools import Tool, build_parameters
 from src.core.agent_ctx import AgentContext
@@ -25,6 +26,12 @@ from src.core.discord_guild import (
 )
 
 logger = logging.getLogger("basuni.elder.tools")
+
+
+def _case_display_number(case: Any) -> int:
+    """Номер дела для показа пользователю («дело №N»). guild_case_number или id."""
+    n = getattr(case, "guild_case_number", None)
+    return n if n is not None else case.id
 
 
 def _deadline_from_case(case: Any) -> timedelta:
@@ -100,6 +107,35 @@ def _court_deadline_info(
         "court_time_remaining_text": text,
         "expired_ru": expired_ru,
     }
+
+
+def _strip_court_boilerplate_for_council(text: str) -> str:
+    """Убирает из текста дела фразы для суда: призыв голосовать, упоминания срока. Совету нужна только суть обращения."""
+    if not (text or "").strip():
+        return ""
+    t = text.strip()
+    # Удалить призыв голосовать (для судей)
+    for phrase in (
+        "Проголосуйте ответом на это сообщение: за или против.",
+        "Проголосуйте ответом на это сообщение или на исходное по делу: за или против.",
+        "проголосуйте ответом на это сообщение: за или против.",
+        "проголосуйте за или против.",
+    ):
+        t = re.sub(re.escape(phrase), "", t, flags=re.IGNORECASE)
+    # Удалить предложения про срок (суд/голосование) — совету не нужны
+    t = re.sub(
+        r"(?m)^.*[Сс]рок\s+(ещё\s+)?(не\s+)?истёк[^.\n]*\.?\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(
+        r"(?m)^.*[Сс]рок\s+для\s+голосования[^.\n]*\.?\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    return t.strip()
 
 
 def _mentions_for_role(bot: Any, guild_id: int, role_config_key: str) -> str:
@@ -179,14 +215,119 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
         if not channel:
             return f"Канал с ID {channel_id} не найден."
         try:
-            await channel.send(content[:2000])
+            text = content[:2000]
+            await channel.send(text)
+            logger.info("Старейшина → [#%s]: %s", getattr(channel, "name", "?"), text[:150].replace("\n", " "))
             return "Сообщение отправлено."
         except Exception as e:
             logger.exception("send_message_to_channel")
             return f"Ошибка отправки: {e!r}"
 
+    async def publish_rejection_to_decisions(reasoning: str) -> str:
+        """Опубликовать в канал решений (elder_decisions) решение об отклонении обращения. Вызывай при отклонении заявки (когда не создаёшь дело): в канал решений уйдёт «По обращению: Отклонено. По причине: …». Старейшина всегда публикует решение в elder_decisions — при отклонении используй этот вызов."""
+        ch_id = ctx.get_channel_id("decisions")
+        if not ch_id and getattr(ctx.bot, "config", None) and getattr(ctx.bot, "role_key", None):
+            ch_id = ctx.bot.config.channel_for_role(ctx.bot.role_key, "decisions")
+        if not ch_id:
+            return "Канал решений (decisions) не настроен. Укажи в конфиге roles.elder.decisions_channel_key и channels.elder_decisions."
+        channel = ctx.bot.get_channel(int(ch_id))
+        if not channel:
+            return f"Канал решений {ch_id} не найден."
+        reason = (reasoning or "").strip() or "По закону оснований для одобрения нет."
+        text = f"**По обращению:** Принято решение: **отклонено** (referendum_rejected). По причине: {reason}"
+        try:
+            await channel.send(text[:2000])
+            logger.info("Старейшина → [#%s]: %s", getattr(channel, "name", "?"), text[:150].replace("\n", " "))
+            return "Решение об отклонении опубликовано в канал решений (elder_decisions)."
+        except Exception as e:
+            logger.exception("publish_rejection_to_decisions")
+            return f"Ошибка отправки в канал решений: {e!r}"
+
+    async def create_elder_case(content: str) -> str:
+        """Создать дело старейшины (при одобрении заявки). Вызывай только когда решил одобрить обращение и передать его в суд. Делу присваивается номер; этот номер (case_id) используй в publish_decision, notify_court, record_case_sent_to_court. content — **полный текст обращения пользователя целиком**: все абзацы, все пункты (1), 2)...), положения закона, обоснования — без сокращений и пересказа. Этот текст сохраняется как initial_content и при передаче дела в совет (notify_council) уходит совету именно он; если передать краткую «суть», совет получит неполную информацию."""
+        author_id = ctx.extra.get("author_id")
+        channel_id = ctx.extra.get("channel_id")
+        thread_id = ctx.extra.get("thread_id")
+        if author_id is None or channel_id is None:
+            return "Ошибка: в контексте нет author_id или channel_id. create_elder_case вызывается только при обработке заявки гражданина в канале обращений."
+        try:
+            cid = await ctx.bot.create_elder_case(
+                ctx.guild_id,
+                int(author_id),
+                int(channel_id),
+                int(thread_id) if thread_id is not None else None,
+                (content or "").strip() or "(суть не указана)",
+            )
+            return f"Дело создано. case_id={cid}. Дальше **обязательно в этом порядке**: (1) publish_decision(case_id=\"{cid}\", decision=\"referendum_approved\", reasoning=\"причина по закону, напр. ст. 19\") — чтобы решение появилось в канале решений старейшин; (2) notify_court(текст с Дело №{cid} и сутью); (3) record_case_sent_to_court(case_id=\"{cid}\", content_sent=тот же текст). Без publish_decision решение не считается принятым и не отображается в канале решений."
+        except Exception as e:
+            logger.exception("create_elder_case")
+            return f"Ошибка создания дела: {e!r}"
+
     async def notify_court(content: str) -> str:
-        """Уведомить суд: отправить сообщение в канал суда (court_inbox), с упоминанием судей (@). В тексте обязательно: номер дела (Дело №N), суть; в конце добавь: «Проголосуйте ответом на это сообщение: за или против.» (судьи могут голосовать ответом на сообщение или на напоминание). После вызова обязательно record_case_sent_to_court(case_id, content_sent=этот_текст)."""
+        """Уведомить суд: отправить сообщение в канал суда (court_inbox), с упоминанием судей (@). В тексте обязательно: номер дела (Дело №X — подставляй реальный номер из контекста «Текущее обращение по делу №X», никогда не пиши букву N), суть; в конце: «Проголосуйте ответом на это сообщение: за или против.» После вызова обязательно record_case_sent_to_court(case_id, content_sent=этот_текст). Не вызывай notify_court, если по этому делу уже вызван publish_decision(referendum_rejected)."""
+        current_cid = ctx.extra.get("current_case_id")
+        display_no: int | None = None
+        if current_cid is not None:
+            try:
+                cid = int(current_cid)
+            except (TypeError, ValueError):
+                cid = None
+            if cid is not None:
+                async with ctx.db_session_factory() as session:
+                    res = await session.execute(select(ElderCase).where(ElderCase.id == cid, ElderCase.guild_id == ctx.guild_id))
+                    cur_case = res.scalars().one_or_none()
+                if cur_case and getattr(cur_case, "elder_decision", None) == "referendum_rejected":
+                    return "Дело по текущему обращению уже отклонено (referendum_rejected). В суд не отправляю. Не вызывай notify_court после отклонения."
+                if cur_case and getattr(cur_case, "sent_to_court_at", None) is not None:
+                    return "Дело уже передано в суд в этом ответе; повторная отправка не выполняется."
+                if cur_case:
+                    display_no = _case_display_number(cur_case)
+                elif cid is not None:
+                    # Дело не найдено в этой сессии — подставляем хотя бы id, чтобы никогда не отправлять букву N
+                    display_no = cid
+        # Если в тексте есть «Дело №N», а номера нет в контексте — берём последнее открытое дело гильдии (ещё не в суде)
+        text_to_send = (content or "").strip()
+        if display_no is None and re.search(r"№\s*N\b|Дело\s*№\s*N\b", text_to_send, re.IGNORECASE):
+            async with ctx.db_session_factory() as session:
+                res = await session.execute(
+                    select(ElderCase)
+                    .where(
+                        and_(
+                            ElderCase.guild_id == ctx.guild_id,
+                            ElderCase.status == "open",
+                            ElderCase.sent_to_court_at.is_(None),
+                        )
+                    )
+                    .order_by(ElderCase.id.desc())
+                    .limit(1)
+                )
+                fallback_case = res.scalars().one_or_none()
+            if fallback_case:
+                display_no = _case_display_number(fallback_case)
+                logger.warning(
+                    "notify_court: current_case_id отсутствует в контексте (extra), подставляю номер из последнего открытого дела id=%s display_no=%s",
+                    fallback_case.id, display_no,
+                )
+        logger.info(
+            "notify_court: current_cid=%s guild_id=%s display_no=%s",
+            current_cid, ctx.guild_id, display_no,
+        )
+        # Подстановка реального номера дела вместо «Дело №N» / «дело №n» — всегда, если есть display_no или хотя бы fallback
+        if display_no is not None:
+            for pattern in (
+                re.compile(r"Дело\s*№\s*N\b", re.IGNORECASE),
+                re.compile(r"дело\s*№\s*n\b", re.IGNORECASE),
+                re.compile(r"Дело\s*№N\b", re.IGNORECASE),
+                re.compile(r"дело\s*#\s*N\b", re.IGNORECASE),
+            ):
+                text_to_send = pattern.sub(f"Дело №{display_no}", text_to_send)
+            # Любой оставшийся «№N» / «№ N» (напр. после «Дело »)
+            if re.search(r"№\s*N\b", text_to_send, re.IGNORECASE):
+                logger.warning("notify_court: в тексте осталось «№N», подставляю display_no=%s", display_no)
+                text_to_send = re.sub(r"№\s*N\b", f"№{display_no}", text_to_send, flags=re.IGNORECASE)
+        # Финальная проверка: если буква N всё ещё в контексте номера дела — заменяем (любой формат)
+        if re.search(r"Дело\s*[№#]\s*N\b", text_to_send, re.IGNORECASE) and display_no is not None:
+            text_to_send = re.sub(r"(Дело\s*[№#]\s*)N\b", rf"\g<1>{display_no}", text_to_send, flags=re.IGNORECASE)
         ch_id = ctx.get_channel_id("notify_court")
         if not ch_id:
             return "В конфиге не задан канал суда (notify_court). Используй send_message_to_channel с ID из контекста."
@@ -194,31 +335,164 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
         if not channel:
             return f"Канал суда {ch_id} не найден."
         mentions = _mentions_for_role(ctx.bot, ctx.guild_id, "judge")
-        full = (f"{mentions}\n\n{content}" if mentions else content).strip()[:2000]
+        full = (f"{mentions}\n\n{text_to_send}" if mentions else text_to_send).strip()[:2000]
         try:
             await channel.send(full)
-            return "Уведомление в суд отправлено (судьи упомянуты)."
+            logger.info("Старейшина → [#%s]: %s", getattr(channel, "name", "?"), full[:200].replace("\n", " "))
         except Exception as e:
             logger.exception("notify_court")
             return f"Ошибка отправки в суд: {e!r}"
+        # Сразу фиксируем в БД: отсчёт срока суда (старейшина обязан отслеживать и вернуть дело при истечении)
+        if current_cid is not None:
+            try:
+                cid = int(current_cid)
+            except (TypeError, ValueError):
+                cid = None
+            if cid is not None:
+                try:
+                    deadline_hours = 24.0
+                    try:
+                        rcfg = getattr(ctx.bot, "config", None) and getattr(ctx.bot.config, "role_config", None)
+                        if callable(rcfg):
+                            rcfg = rcfg("elder")
+                        if isinstance(rcfg, dict):
+                            val = rcfg.get("court_deadline_hours", 24)
+                            deadline_hours = float(val) if val is not None else 24.0
+                            if deadline_hours <= 0:
+                                deadline_hours = 24.0
+                    except (TypeError, ValueError):
+                        pass
+                    now = datetime.now(timezone.utc)
+                    if 0 < deadline_hours < 1:
+                        values = {
+                            "sent_to_court_at": now,
+                            "court_deadline_minutes": round(deadline_hours * 60),
+                            "court_deadline_hours": None,
+                            "sent_to_court_content": text_to_send[:8000],
+                        }
+                    else:
+                        values = {
+                            "sent_to_court_at": now,
+                            "court_deadline_hours": round(deadline_hours),
+                            "court_deadline_minutes": None,
+                            "sent_to_court_content": text_to_send[:8000],
+                        }
+                    async with ctx.db_session_factory() as session:
+                        await session.execute(
+                            update(ElderCase)
+                            .where(ElderCase.id == cid, ElderCase.guild_id == ctx.guild_id)
+                            .values(**values)
+                        )
+                        await session.commit()
+                    logger.info("Старейшина: дело №%s зафиксировано как переданное в суд (notify_court), отсчёт срока начат", cid)
+                    # Всегда постим в канал решений при отправке в суд (чтобы решение было видно даже если модель не вызвала publish_decision)
+                    ch_decisions = ctx.get_channel_id("decisions") if hasattr(ctx, "get_channel_id") else None
+                    if not ch_decisions and getattr(ctx.bot, "config", None):
+                        ch_decisions = getattr(ctx.bot.config, "channel_for_role", None)
+                        if callable(ch_decisions):
+                            ch_decisions = ch_decisions("elder", "decisions")
+                    if ch_decisions:
+                        ch = ctx.bot.get_channel(int(ch_decisions))
+                        if ch:
+                            try:
+                                num = display_no if display_no is not None else cid
+                                # Если старейшина не вызвал publish_decision — фиксируем решение в БД и постим в канал с причиной
+                                default_reasoning = "Одобрено по процедуре (ст. 19). Обращение передано в суд."
+                                reason_text = default_reasoning
+                                async with ctx.db_session_factory() as session:
+                                    r = await session.execute(select(ElderCase).where(ElderCase.id == cid, ElderCase.guild_id == ctx.guild_id))
+                                    case_row = r.scalars().one_or_none()
+                                    if case_row and not getattr(case_row, "elder_already_decided", False):
+                                        await session.execute(
+                                            update(ElderCase)
+                                            .where(ElderCase.id == cid, ElderCase.guild_id == ctx.guild_id)
+                                            .values(
+                                                elder_decided_at=now,
+                                                elder_decision="referendum_approved",
+                                                elder_reasoning=default_reasoning,
+                                                elder_already_decided=True,
+                                            )
+                                        )
+                                        await session.commit()
+                                    elif case_row and getattr(case_row, "elder_reasoning", None):
+                                        reason_text = (case_row.elder_reasoning or "").strip() or default_reasoning
+                                await ch.send(
+                                    f"**По делу №{num}:** Принято решение: **одобрено, передано в суд** (referendum_approved). "
+                                    f"По причине: {reason_text}"
+                                )
+                                logger.info("Старейшина: notify_court — решение опубликовано в канал решений channel_id=%s", ch_decisions)
+                            except Exception as dec_e:
+                                logger.exception("notify_court: не удалось отправить в канал решений (channel_id=%s): %s", ch_decisions, dec_e)
+                        else:
+                            logger.warning("notify_court: канал решений id=%s не найден ботом", ch_decisions)
+                    else:
+                        logger.warning("notify_court: канал решений (decisions) не настроен для старейшины")
+                except Exception:
+                    logger.exception("notify_court: не удалось записать sent_to_court_at по делу %s", current_cid)
+        return "Уведомление в суд отправлено (судьи упомянуты). Отсчёт срока суда зафиксирован."
 
-    async def notify_council(content: str) -> str:
-        """Уведомить совет: отправить сообщение в канал совета (council_inbox), с упоминанием всех членов совета (@). В content обязательно: (1) номер дела (Дело №N), (2) суть дела **полностью** — передавай полное содержание из get_case(N).sent_to_court_content или initial_content (не сокращай), чтобы члены совета видели, что обсуждают, и могли обдумать и вынести решение. Формат: «Дело №N. Решение старейшин: передаётся на исполнение в совет. Суть (полностью): [содержание дела целиком]». После отправки ставится галочка (✅)."""
+    async def notify_council(case_id: str) -> str:
+        """Уведомить совет: отправить в канал совета (council_inbox) сообщение по делу. Текст берётся из базы (initial_content или sent_to_court_content) — в совет уходит именно то, что сохранено при create_elder_case; поэтому при создании дела в content передавай полный текст обращения пользователя. Из текста убираются только фразы для суда (призыв «проголосовать», упоминания срока). Вызывай после publish_decision(send_to_council). Упоминания совета (@) и галочка ставятся автоматически."""
+        try:
+            cid = int(case_id)
+        except (ValueError, TypeError):
+            return "Ошибка: укажи номер дела числом (case_id)."
         ch_id = ctx.get_channel_id("notify_council")
         if not ch_id:
             return "В конфиге не задан канал совета (notify_council). Используй send_message_to_channel с ID из контекста."
         channel = ctx.bot.get_channel(ch_id)
         if not channel:
             return f"Канал совета {ch_id} не найден."
+        async with ctx.db_session_factory() as session:
+            result = await session.execute(
+                select(ElderCase).where(ElderCase.id == cid, ElderCase.guild_id == ctx.guild_id)
+            )
+            case = result.scalars().one_or_none()
+        if not case:
+            return f"Дело №{case_id} не найдено. Сначала get_case и publish_decision(send_to_council)."
+        _labels = {
+            "referendum_request": "референдум",
+            "civil_initiative": "гражданская инициатива",
+            "bill": "законопроект",
+            "appeal_procedure": "апелляция по процедуре",
+            "not_established_by_court": "не установлено судом",
+        }
+        case_type_label = _labels.get(case.case_type) or case.case_type
+        # В совет отправляем полный запрос так, как описал пользователь (initial_content в приоритете).
+        raw = (case.initial_content or "").strip() or (getattr(case, "sent_to_court_content", None) or "").strip()
+        body = _strip_court_boilerplate_for_council(raw)
+        if not body:
+            body = "(текст дела не сохранён в базе; см. get_case и initial_content при следующей передаче в суд)"
+        header = f"Дело №{_case_display_number(case)}. Тип процедуры: {case_type_label}. Решение старейшин: передаётся на исполнение в совет.\n\nЗапрос полностью (как описал обратившийся):\n"
         mentions = _mentions_for_role(ctx.bot, ctx.guild_id, "council")
-        full = (f"{mentions}\n\n{content}" if mentions else content).strip()[:2000]
+        chunk_limit = 2000
         try:
-            msg = await channel.send(full)
-            try:
-                await msg.add_reaction("✅")
-            except Exception as re:
-                logger.debug("notify_council: не удалось поставить реакцию на своё сообщение: %s", re)
-            return "Уведомление в совет отправлено (члены совета упомянуты). На сообщение поставлена галочка."
+            first_content = (f"{mentions}\n\n{header}" if mentions else header).strip()
+            remaining = len(first_content)
+            if remaining < chunk_limit and body:
+                take = min(len(body), chunk_limit - remaining - 1)
+                first_content = first_content + "\n" + body[:take]
+                body = body[take:]
+            elif len(first_content) > chunk_limit:
+                first_content = first_content[: chunk_limit - 3].rstrip() + "…"
+            last_msg = await channel.send(first_content)
+            logger.info("Старейшина → [#%s]: %s", getattr(channel, "name", "?"), first_content[:200].replace("\n", " "))
+            offset = 0
+            while offset < len(body):
+                chunk = body[offset : offset + chunk_limit]
+                offset += len(chunk)
+                if chunk.strip():
+                    last_msg = await channel.send(chunk)
+            if last_msg is None:
+                async for msg in channel.history(limit=1):
+                    last_msg = msg
+                    break
+            if last_msg:
+                try:
+                    await last_msg.add_reaction("✅")
+                except Exception as re:
+                    logger.debug("notify_council: не удалось поставить реакцию: %s", re)
+            return "Уведомление в совет отправлено: передан полный запрос обратившегося (initial_content). Члены совета упомянуты, галочка поставлена."
         except Exception as e:
             logger.exception("notify_council")
             return f"Ошибка отправки в совет: {e!r}"
@@ -234,15 +508,20 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
         if not channel:
             return f"Канал судебных прецедентов {ch_id} не найден."
         try:
-            await channel.send((content or "").strip()[:2000])
+            prec_text = (content or "").strip()[:2000]
+            await channel.send(prec_text)
+            logger.info("Старейшина → [#%s]: %s", getattr(channel, "name", "?"), prec_text[:150].replace("\n", " "))
             return "Прецедент опубликован в канал судебных прецедентов (law_judicial_precedents)."
         except Exception as e:
             logger.exception("publish_judicial_precedent")
             return f"Ошибка публикации прецедента: {e!r}"
 
-    async def publish_decision(case_id: str, decision: str, reasoning: str) -> str:
+    async def publish_decision(case_id: str = "", decision: str = "", reasoning: str = "", **kwargs: Any) -> str:
         """Опубликовать решение старейшин. reasoning — твоя причина. По первому обращению: только referendum_approved (→ notify_court, record_case_sent_to_court) или referendum_rejected; передавать в совет нельзя. send_to_council, confirm_process, return_to_court допустимы только по делу, возвращённому старейшинам (срок суда истёк или судьи разошлись). После send_to_council обязательно notify_council."""
         from src.roles.elder.logic import elder_may_decide, elder_may_decide_for_case
+        case_id = case_id or kwargs.get("case_id") or kwargs.get("case_id=") or ""
+        decision = decision or kwargs.get("decision") or kwargs.get("decision=") or ""
+        reasoning = reasoning or kwargs.get("reasoning") or kwargs.get("reasoning=") or ""
         try:
             cid = int(case_id)
         except (ValueError, TypeError):
@@ -256,7 +535,7 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             if not elder_may_decide(decision):
                 return f"Недопустимое решение для старейшин: {decision}"
             if not elder_may_decide_for_case(decision, case.case_type):
-                return f"По делу типа «{case.case_type}» допустимы только: для референдума — referendum_approved или referendum_rejected; для апелляции — confirm_process, send_to_council, return_to_court."
+                return f"По делу типа «{case.case_type}» допустимы только: для референдума/законопроекта/гражданской инициативы — referendum_approved или referendum_rejected; для апелляции — confirm_process, send_to_council, return_to_court."
             # Передать в совет можно только по делу, возвращённому старейшинам (срок суда истёк или судьи разошлись). По первому обращению — только в суд или отклонение.
             if decision in ("send_to_council", "confirm_process", "return_to_court"):
                 returned_at = getattr(case, "returned_to_elder_at", None)
@@ -267,20 +546,45 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                         "(срок суда истёк или судьи разошлись). По первому обращению старейшина не передаёт дело в совет — предложите обратившемуся оформить запрос в суд (референдум, законопроект, гражданская инициатива)."
                     )
             if case.elder_already_decided:
+                current_id = ctx.extra.get("current_case_id")
+                try:
+                    current_cid = int(current_id) if current_id is not None else None
+                except (TypeError, ValueError):
+                    current_cid = None
+                if current_cid is not None and cid != current_cid:
+                    return (
+                        f"По делу №{cid} старейшины уже выносили решение. "
+                        f"Текущее обращение в этой ветке — по делу №{current_cid}. "
+                        f"Для принятия решения по текущему обращению используй case_id={current_cid} "
+                        "(publish_decision, затем notify_court и record_case_sent_to_court)."
+                    )
                 return "По этому делу старейшины уже выносили решение; повторное вмешательство не допускается (Статья IV, п. 6)."
 
             ch_id = ctx.get_channel_id("decisions")
+            if not ch_id and getattr(ctx.bot, "config", None) and getattr(ctx.bot, "role_key", None):
+                ch_id = ctx.bot.config.channel_for_role(ctx.bot.role_key, "decisions")
             if ch_id:
                 channel = ctx.bot.get_channel(ch_id)
                 if channel:
-                    text_msg = f"**По делу №{case_id}:** Принято решение: {decision}. По причине: {reasoning}"
+                    decision_labels = {
+                        "send_to_council": "передать на исполнение в совет",
+                        "return_to_court": "вернуть в суд",
+                        "confirm_process": "подтвердить процесс",
+                        "referendum_approved": "одобрено, передано в суд",
+                        "referendum_rejected": "отклонено (дело закрыто)",
+                    }
+                    label_ru = decision_labels.get(decision, decision)
+                    text_msg = (
+                        f"**По делу №{_case_display_number(case)}:** Принято решение: **{label_ru}** ({decision}). "
+                        f"По причине: {reasoning}"
+                    )
                     try:
                         await channel.send(text_msg[:2000])
+                        logger.info("Старейшина → [#%s]: %s", getattr(channel, "name", "?"), text_msg[:150].replace("\n", " "))
                     except Exception as e:
                         logger.exception("publish_decision send")
-                        return f"Ошибка публикации в канал: {e!r}"
-            else:
-                return "В конфиге не задан канал для решений (decisions). Используй get_channels и send_message_to_channel для публикации в нужный канал."
+                else:
+                    logger.warning("publish_decision: канал decisions id=%s не найден ботом", ch_id)
 
             # По референдуму одобренное — оставляем open, чтобы после notify_court + record_case_sent_to_court дело попадало в list_cases_pending_court для отслеживания; остальное — закрываем
             new_status = "open" if decision == "referendum_approved" else "closed"
@@ -315,6 +619,7 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             case = result.scalars().one_or_none()
             if not case:
                 return f"Дело №{case_id} не найдено."
+            display_no = _case_display_number(case)
             meta = {}
             if case.meta:
                 try:
@@ -343,9 +648,19 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                 }
                 for r in votes_result.scalars().all()
             ]
+            _case_type_labels = {
+                "referendum_request": "референдум",
+                "civil_initiative": "гражданская инициатива",
+                "bill": "законопроект",
+                "appeal_procedure": "апелляция по процедуре",
+                "not_established_by_court": "не установлено судом",
+            }
+            case_type_label_ru = _case_type_labels.get(case.case_type) or case.case_type
             return json.dumps({
                 "id": case.id,
+                "display_number": display_no,
                 "case_type": case.case_type,
+                "case_type_label_ru": case_type_label_ru,
                 "status": case.status,
                 "author_id": case.author_id,
                 "initial_content": case.initial_content,
@@ -426,12 +741,41 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             case = result.scalars().one_or_none()
             if not case:
                 return f"Дело №{case_id} не найдено."
+            if getattr(case, "elder_decision", None) == "referendum_rejected" or (
+                getattr(case, "elder_already_decided", False) and getattr(case, "status", None) == "closed"
+            ):
+                return "Дело отклонено старейшиной (referendum_rejected). Передача в суд не производится; record_case_sent_to_court после отклонения не вызывай."
+            display_no = _case_display_number(case)
+            # Если дело уже зафиксировано при отправке (notify_court) — не сбрасываем срок, только обновляем текст при необходимости
+            already_sent = getattr(case, "sent_to_court_at", None) is not None
+            if already_sent:
+                if content_clean:
+                    for pat in (
+                        re.compile(r"Дело\s*№\s*N\b", re.IGNORECASE),
+                        re.compile(r"дело\s*№\s*n\b", re.IGNORECASE),
+                        re.compile(r"Дело\s*№N\b", re.IGNORECASE),
+                    ):
+                        content_clean = pat.sub(f"Дело №{display_no}", content_clean)
+                    await session.execute(
+                        update(ElderCase)
+                        .where(ElderCase.id == cid, ElderCase.guild_id == ctx.guild_id)
+                        .values(sent_to_court_content=content_clean[:8000])
+                    )
+                await session.commit()
+                return f"Дело №{display_no} уже было зафиксировано при отправке в суд (notify_court). Отсчёт срока не сбрасывается." + (" Текст в деле обновлён." if content_clean else "")
             now = datetime.now(timezone.utc)
             if 0 < deadline_hours < 1:
                 values = {"sent_to_court_at": now, "court_deadline_minutes": round(deadline_hours * 60), "court_deadline_hours": None}
             else:
                 values = {"sent_to_court_at": now, "court_deadline_hours": round(deadline_hours), "court_deadline_minutes": None}
             if content_clean:
+                # Подставить реальный номер дела вместо «Дело №N», если модель передала букву N
+                for pat in (
+                    re.compile(r"Дело\s*№\s*N\b", re.IGNORECASE),
+                    re.compile(r"дело\s*№\s*n\b", re.IGNORECASE),
+                    re.compile(r"Дело\s*№N\b", re.IGNORECASE),
+                ):
+                    content_clean = pat.sub(f"Дело №{display_no}", content_clean)
                 values["sent_to_court_content"] = content_clean[:8000]
             await session.execute(
                 update(ElderCase)
@@ -446,9 +790,9 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                     )
                 )
         if 0 < deadline_hours < 1:
-            out = f"Отсчёт срока для суда по делу №{case_id} начат. Срок: {round(deadline_hours * 60)} мин."
+            out = f"Отсчёт срока для суда по делу №{display_no} начат. Срок: {round(deadline_hours * 60)} мин."
         else:
-            out = f"Отсчёт срока для суда по делу №{case_id} начат. Срок: {round(deadline_hours)} ч."
+            out = f"Отсчёт срока для суда по делу №{display_no} начат. Срок: {round(deadline_hours)} ч."
         if content_clean:
             out += " Текст, отправленный в суд, сохранён в деле (для сопоставления и решений)."
         if is_return_to_court:
@@ -487,6 +831,7 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                 sent_to_court_preview += "..."
             out.append({
                 "id": c.id,
+                "display_number": _case_display_number(c),
                 "case_type": c.case_type,
                 "initial_content": content_preview or "(нет текста)",
                 "sent_to_court_content": sent_to_court_preview or None,
@@ -528,6 +873,7 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                 content_preview += "..."
             out.append({
                 "id": c.id,
+                "display_number": _case_display_number(c),
                 "case_type": c.case_type,
                 "returned_to_elder_reason": getattr(c, "returned_to_elder_reason", None),
                 "initial_content": content_preview or "(нет текста)",
@@ -623,7 +969,7 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
                 select(ElderCase)
                 .where(
                     ElderCase.guild_id == ctx.guild_id,
-                    ElderCase.case_type.in_(["appeal_procedure", "referendum_request", "not_established_by_court"]),
+                    ElderCase.case_type.in_(["appeal_procedure", "referendum_request", "civil_initiative", "bill", "not_established_by_court"]),
                     ElderCase.status == status,
                 )
             )
@@ -631,7 +977,7 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             if not cases:
                 return "Нет дел с указанным статусом."
             return json.dumps(
-                [{"id": c.id, "case_type": c.case_type, "status": c.status, "created_at": str(c.created_at)} for c in cases],
+                [{"id": c.id, "display_number": _case_display_number(c), "case_type": c.case_type, "status": c.status, "created_at": str(c.created_at)} for c in cases],
                 ensure_ascii=False,
             )
 
@@ -724,26 +1070,38 @@ def make_elder_tools(ctx: AgentContext) -> list[Tool]:
             execute=send_message_to_channel,
         ),
         Tool(
+            name="create_elder_case",
+            description="Создать дело (при одобрении заявки). Вызывай только когда решил одобрить обращение и передать в суд. Делу присваивается номер; вернувшийся case_id используй в publish_decision, notify_court, record_case_sent_to_court. content — полный текст обращения пользователя целиком (все абзацы, пункты, положения), без сокращений — этот текст потом уходит в совет.",
+            parameters=build_parameters({"content": ("string", "Полный текст обращения пользователя целиком: все абзацы, пункты (1), 2)...), положения закона, обоснования. Не сокращай — иначе в совет придёт неполная информация.")}, required=["content"]),
+            execute=create_elder_case,
+        ),
+        Tool(
             name="notify_court",
-            description="Уведомить суд: отправить сообщение в канал суда (судьи @). В тексте: номер дела (Дело №N), суть; в конце обязательно добавь: «Проголосуйте ответом на это сообщение: за или против.» (судьи голосуют ответом на сообщение или на напоминание). При первой передаче: «Дело №N. От гражданина X: законопроект — [суть]. Проголосуйте ответом на это сообщение: за или против.» При возврате в суд — суть, причина возврата, и ту же фразу про голос ответом. После вызова — record_case_sent_to_court(case_id, content_sent=этот_текст).",
-            parameters=build_parameters({"content": ("string", "Текст для суда: Дело №N, суть (при возврате в суд — кратко суть + причина возврата)")}, required=["content"]),
+            description="Уведомить суд: отправить сообщение в канал суда (судьи @). В тексте: номер дела — Дело №X (подставляй реальный номер из контекста «Текущее обращение по делу №X», никогда не пиши букву N), суть; в конце: «Проголосуйте ответом на это сообщение: за или против.» При первой передаче: «Дело №X. От гражданина [имя]: гражданская инициатива / законопроект — [суть]. Проголосуйте…» После вызова — record_case_sent_to_court(case_id, content_sent=этот_текст).",
+            parameters=build_parameters({"content": ("string", "Текст для суда: Дело №X (реальный номер дела из контекста), суть обращения")}, required=["content"]),
             execute=notify_court,
         ),
         Tool(
             name="notify_council",
-            description="Уведомить совет: отправить сообщение в канал совета. В content: (1) номер дела (Дело №N), (2) суть дела **полностью** — полное содержание из get_case(N).sent_to_court_content или initial_content (не сокращай), чтобы члены совета видели, что обсуждают. Формат: «Дело №N. Решение старейшин: передаётся на исполнение в совет. Суть (полностью): [содержание целиком]». Упоминания (@) подставляются автоматически. Вызывай при send_to_council.",
-            parameters=build_parameters({"content": ("string", "Текст для совета: Дело №N и полная суть дела (содержание целиком)")}, required=["content"]),
+            description="Уведомить совет по делу: отправить в канал совета сообщение. Текст сути автоматически берётся из базы (sent_to_court_content или initial_content) — совет всегда получает полную суть дела. Вызывай с case_id после publish_decision(case_id, send_to_council, reasoning). Упоминания (@) и галочка — автоматически.",
+            parameters=build_parameters({"case_id": ("string", "Номер дела (после send_to_council)")}, required=["case_id"]),
             execute=notify_council,
         ),
         Tool(
             name="publish_decision",
-            description="Опубликовать решение старейшин. По референдуму — только referendum_approved (одобрено, дальше в суд; затем notify_court и record_case_sent_to_court) или referendum_rejected (отклонено, дело закрыто навсегда). По апелляции: confirm_process, send_to_council, return_to_court. По одному делу — один раз.",
+            description="Опубликовать решение старейшин в канал решений (elder_decisions). **Обязателен по каждому делу:** ты всегда принимаешь решение и выставляешь его в канал решений; без этого вызова решение не считается принятым. По референдуму/инициативе: referendum_approved (одобрено → затем notify_court, record_case_sent_to_court) или referendum_rejected (отклонено). По апелляции: confirm_process, send_to_council, return_to_court. Вызывай до notify_court при одобрении.",
             parameters=build_parameters({
                 "case_id": ("string", "Номер дела"),
                 "decision": ("string", "referendum_approved | referendum_rejected (референдум) или confirm_process | send_to_council | return_to_court (апелляция)"),
                 "reasoning": ("string", "Твоя причина решения: почему отклонил или почему одобрил/передал в совет (по закону, по существу). Не «суд не вынес решение» — это повод забрать дело; причина — твоя мотивировка."),
             }),
             execute=publish_decision,
+        ),
+        Tool(
+            name="publish_rejection_to_decisions",
+            description="Опубликовать в канал решений (elder_decisions) решение об отклонении обращения. Вызывай при отклонении заявки (дело не создаётся): решение «Отклонено. По причине: …» появится в канале решений. Старейшина всегда публикует решение в elder_decisions — при отклонении используй этот вызов.",
+            parameters=build_parameters({"reasoning": ("string", "Причина отклонения по закону")}, required=["reasoning"]),
+            execute=publish_rejection_to_decisions,
         ),
         Tool(
             name="publish_judicial_precedent",
